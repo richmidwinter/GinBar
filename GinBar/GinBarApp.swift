@@ -1,17 +1,69 @@
-//
-//  GinBarApp.swift
-//  GinBar
-//
-//  Created by rich on 12/04/2026.
-//
-
 import SwiftUI
+import Combine
+
+class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Show in Dock so user can quit via right-click
+        NSApp.setActivationPolicy(.regular)
+        
+        // Hide the main SwiftUI window (not overlay windows which are borderless)
+        for window in NSApp.windows {
+            // Only close titled windows (SwiftUI creates these, not our overlays)
+            if window.styleMask.contains(.titled) {
+                window.close()
+                break
+            }
+        }
+        
+        // Setup shutdown handler
+        setupShutdownHandler()
+    }
+    
+    func setupShutdownHandler() {
+        // Force close all borderless overlay windows on quit
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            print("[GinBar] Terminating - closing all windows")
+            for window in NSApp.windows {
+                if window.styleMask == .borderless {
+                    window.orderOut(nil)
+                    window.close()
+                }
+            }
+            // Force screen refresh
+            NSScreen.screens.forEach { _ in }
+        }
+        
+        // Also handle Cmd+Q
+        NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { event in
+            if event.keyCode == 12 && event.modifierFlags.contains(.command) { // Cmd+Q
+                print("[GinBar] Cmd+Q detected")
+                NSApp.terminate(nil)
+            }
+        }
+    }
+}
 
 @main
 struct GinBarApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    @StateObject private var state = AppState()
+    
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            EmptyView()
+        }
+        .defaultSize(width: 0, height: 0)
+        
+        Settings {
+            SettingsView().environmentObject(state)
+        }
+        
+        MenuBarExtra("GinBar", systemImage: "line.3.horizontal") {
+            MenuBarView().environmentObject(state)
         }
     }
 }
