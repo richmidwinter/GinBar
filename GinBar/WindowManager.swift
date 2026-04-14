@@ -1,6 +1,7 @@
 import Cocoa
 import Combine
 import ScreenCaptureKit
+import ApplicationServices
 
 struct WindowInfo: Identifiable {
     let id: CGWindowID
@@ -247,8 +248,39 @@ class WindowManager: ObservableObject {
     func focusWindow(_ window: WindowInfo) {
         guard !isRunningInPreview else { return }
         guard let app = NSRunningApplication(processIdentifier: window.pid) else { return }
-        app.activate()
+        app.activate(options: .activateIgnoringOtherApps)
         
+        // Try to raise the specific window via Accessibility API
+        let appElement = AXUIElementCreateApplication(window.pid)
+        var value: AnyObject?
+        let result = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value)
+        
+        if result == .success, let axWindows = value as? [AXUIElement] {
+            for axWindow in axWindows {
+                var positionRef: CFTypeRef?
+                var sizeRef: CFTypeRef?
+                AXUIElementCopyAttributeValue(axWindow, kAXPositionAttribute as CFString, &positionRef)
+                AXUIElementCopyAttributeValue(axWindow, kAXSizeAttribute as CFString, &sizeRef)
+                
+                if let positionRef = positionRef, let sizeRef = sizeRef {
+                    var position = CGPoint.zero
+                    var size = CGSize.zero
+                    AXValueGetValue(positionRef as! AXValue, .cgPoint, &position)
+                    AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
+                    let axFrame = CGRect(origin: position, size: size)
+                    
+                    if abs(axFrame.minX - window.frame.minX) < 5 &&
+                       abs(axFrame.minY - window.frame.minY) < 5 &&
+                       abs(axFrame.width - window.frame.width) < 5 &&
+                       abs(axFrame.height - window.frame.height) < 5 {
+                        AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
+                        return
+                    }
+                }
+            }
+        }
+        
+        // Fallback: just bring the app frontmost
         let script = """
         tell application "System Events"
             tell process "\(window.appName)"
