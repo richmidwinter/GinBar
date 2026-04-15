@@ -1,97 +1,147 @@
 import SwiftUI
 import AppKit
 
-// Menu target singleton
-@objc class MenuActionTarget: NSObject {
-    @objc static let shared = MenuActionTarget()
+final class MenuWindowController {
+    static let shared = MenuWindowController()
     
-    @objc func openApplication(_ sender: NSMenuItem) {
-        guard let url = sender.representedObject as? URL else { return }
-        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+    private var window: NSWindow?
+    private var monitor: Any?
+    private var isHiding = false
+    
+    var isVisible: Bool { window?.isVisible == true }
+    
+    func show(relativeTo button: NSButton, applications: [URL]) {
+        if isVisible { hide() }
+        
+        guard let screen = button.window?.screen ?? NSScreen.main else { return }
+        let barHeight = NSStatusBar.system.thickness
+        let menuHeight = min(CGFloat(applications.count * 28) + 16, 500)
+        let frame = NSRect(
+            x: screen.frame.minX,
+            y: screen.frame.minY + barHeight,
+            width: 220,
+            height: menuHeight
+        )
+        
+        let view = ApplicationsMenuContent(applications: applications) { [weak self] url in
+            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+            self?.hide()
+        }
+        
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(origin: .zero, size: frame.size)
+        
+        if window == nil {
+            let w = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+            w.level = NSWindow.Level.statusBar + 2
+            w.isOpaque = false
+            w.backgroundColor = .clear
+            w.hasShadow = true
+            w.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+            window = w
+        } else {
+            window?.setFrame(frame, display: true)
+        }
+        
+        window?.contentView = hosting
+        window?.orderFront(nil)
+        
+        monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            self?.hide()
+        }
+    }
+    
+    func hide() {
+        guard !isHiding else { return }
+        isHiding = true
+        if let mon = monitor {
+            NSEvent.removeMonitor(mon)
+            monitor = nil
+        }
+        window?.orderOut(nil)
+        isHiding = false
+    }
+}
+
+final class MenuButton: NSButton {
+    var applications: [URL] = []
+    private var isHovered = false {
+        didSet { updateAppearance() }
+    }
+    
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setup()
+    }
+    
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setup()
+    }
+    
+    private func setup() {
+        bezelStyle = .shadowlessSquare
+        isBordered = false
+        image = NSImage(systemSymbolName: "square.grid.2x2", accessibilityDescription: nil)
+        imagePosition = .imageOnly
+        contentTintColor = .white
+        target = self
+        action = #selector(clicked)
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways],
+            owner: self,
+            userInfo: nil
+        ))
+        updateAppearance()
+    }
+    
+    override var bounds: NSRect {
+        didSet {
+            trackingAreas.forEach { removeTrackingArea($0) }
+            addTrackingArea(NSTrackingArea(
+                rect: bounds,
+                options: [.mouseEnteredAndExited, .activeAlways],
+                owner: self,
+                userInfo: nil
+            ))
+        }
+    }
+    
+    @objc private func clicked() {
+        if MenuWindowController.shared.isVisible {
+            MenuWindowController.shared.hide()
+        } else {
+            MenuWindowController.shared.show(relativeTo: self, applications: applications)
+        }
+    }
+    
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+    }
+    
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+    }
+    
+    private func updateAppearance() {
+        wantsLayer = true
+        layer?.cornerRadius = 4
+        layer?.backgroundColor = isHovered
+            ? NSColor.white.withAlphaComponent(0.2).cgColor
+            : NSColor.clear.cgColor
     }
 }
 
 struct ApplicationsMenu: View {
-    @State private var isHovering = false
     @State private var applications: [URL] = []
-    @State private var menuWindow: NSWindow?
     
     var body: some View {
-        Button(action: {
-            showMenu()
-        }) {
-            Image(systemName: "square.grid.2x2")
-                .font(.system(size: 14))
-                .foregroundColor(.white)
-                .frame(width: 24, height: 24)
-                .background(isHovering ? Color.white.opacity(0.2) : Color.clear)
-                .cornerRadius(4)
-        }
-        .buttonStyle(PlainButtonStyle())
-        .frame(width: 24)
-        .onHover { hovering in
-            isHovering = hovering
-        }
-        .onAppear {
-            applications = loadApplications()
-        }
-    }
-    
-    private func showMenu() {
-        // If menu is already showing, close it (toggle behavior)
-        if let window = menuWindow, window.isVisible {
-            window.close()
-            menuWindow = nil
-            return
-        }
-        
-        // Create a new menu window
-        let menuView = ApplicationsMenuContent(applications: applications) { url in
-            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
-            self.menuWindow?.close()
-        }
-        
-        let hostingView = NSHostingView(rootView: menuView)
-        let menuHeight = min(CGFloat(applications.count * 28) + 16, 500)
-        hostingView.frame = NSRect(x: 0, y: 0, width: 220, height: menuHeight)
-        
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 220, height: menuHeight),
-            styleMask: .borderless,
-            backing: .buffered,
-            defer: false
-        )
-        
-        window.contentView = hostingView
-        window.level = NSWindow.Level.statusBar + 2
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = true
-        
-        // Position at bottom left of screen, above the bar
-        if let screen = NSScreen.main ?? NSScreen.screens.first {
-            let barHeight: CGFloat = 22
-            let screenHeight = screen.frame.height
-            let maxMenuHeight = screenHeight / 2 // Half screen height max
-            let actualMenuHeight = min(menuHeight, maxMenuHeight)
-            
-            let xPos = screen.frame.minX
-            // Position menu so its bottom edge is just above the bar
-            // yPos is the bottom of the window
-            let yPos = screen.frame.minY + barHeight
-            
-            window.setFrame(NSRect(x: xPos, y: yPos, width: 220, height: actualMenuHeight), display: true)
-        }
-        
-        window.makeKeyAndOrderFront(nil)
-        menuWindow = window
-        
-        // Close when clicking outside
-        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak window] event in
-            guard let win = window else { return }
-            win.close()
-            // Menu window will be nil'd out in the window's deinit or when toggled
-        }
+        RepresentedButton(applications: applications)
+            .frame(width: 28, height: 24)
+            .onAppear {
+                applications = loadApplications()
+            }
     }
     
     private func loadApplications() -> [URL] {
@@ -120,6 +170,20 @@ struct ApplicationsMenu: View {
             $0.deletingPathExtension().lastPathComponent <
             $1.deletingPathExtension().lastPathComponent
         }
+    }
+}
+
+struct RepresentedButton: NSViewRepresentable {
+    let applications: [URL]
+    
+    func makeNSView(context: Context) -> MenuButton {
+        let button = MenuButton(frame: NSRect(x: 0, y: 0, width: 24, height: 24))
+        button.applications = applications
+        return button
+    }
+    
+    func updateNSView(_ nsView: MenuButton, context: Context) {
+        nsView.applications = applications
     }
 }
 
@@ -164,6 +228,7 @@ struct ApplicationsMenuContent: View {
             }
             .padding(.vertical, 8)
         }
+        .frame(width: 220)
         .background(
             RoundedRectangle(cornerRadius: 8)
                 .fill(Color.black.opacity(0.85))
