@@ -96,7 +96,7 @@ class OverlayManager {
     }
 
     private func createBarWindow(for screen: NSScreen) {
-        let barHeight = NSStatusBar.system.thickness
+        let barHeight = NSStatusBar.system.thickness + 4
         
         let frame = NSRect(
             x: screen.frame.origin.x,
@@ -130,7 +130,7 @@ class OverlayManager {
     }
     
     private func createPopupWindow(for screen: NSScreen) {
-        let barHeight = NSStatusBar.system.thickness
+        let barHeight = NSStatusBar.system.thickness + 4
         let popupHeight: CGFloat = 140
         
         let frame = NSRect(

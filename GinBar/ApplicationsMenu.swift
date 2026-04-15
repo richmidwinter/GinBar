@@ -14,7 +14,7 @@ final class MenuWindowController {
         if isVisible { hide() }
         
         guard let screen = button.window?.screen ?? NSScreen.main else { return }
-        let barHeight = NSStatusBar.system.thickness
+        let barHeight = NSStatusBar.system.thickness + 4
         let menuHeight = min(CGFloat(applications.count * 28) + 16, 500)
         let frame = NSRect(
             x: screen.frame.minX,
