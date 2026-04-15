@@ -257,10 +257,12 @@ class WindowManager: ObservableObject {
     
     private var axObservers: [pid_t: AXObserver] = [:]
     private var axCleanupTimer: Timer?
+    private var originalDockAutohide: Bool?
     
     func startAdjustingWindowsForBar(barHeight: CGFloat) {
         guard !isRunningInPreview else { return }
         self.barHeight = barHeight
+        hideSystemDock()
         setupAXObservers()
         adjustWindowsForBar()
         
@@ -283,6 +285,152 @@ class WindowManager: ObservableObject {
             name: NSWorkspace.didTerminateApplicationNotification,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(willTerminate),
+            name: NSApplication.willTerminateNotification,
+            object: nil
+        )
+    }
+    
+    private var originalDockAutohideDelay: Float?
+    
+    private func hideSystemDock() {
+        let autohide = dockAutohide()
+        let delay = dockAutohideDelay()
+        originalDockAutohide = autohide
+        originalDockAutohideDelay = delay
+        
+        // Write crash-recovery state
+        let fm = FileManager.default
+        let supportDir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("GinBar", isDirectory: true)
+        try? fm.createDirectory(at: supportDir, withIntermediateDirectories: true)
+        let state = [
+            "autohide": autohide,
+            "autohideDelay": delay
+        ] as [String: Any]
+        let stateURL = supportDir.appendingPathComponent("dockRestore.plist")
+        try? (state as NSDictionary).write(to: stateURL)
+        
+        // Install LaunchAgent for crash recovery
+        installDockRestoreAgent()
+        
+        setDockAutohide(true)
+        setDockAutohideDelay(1000)
+        restartDock()
+    }
+    
+    private func restoreSystemDock() {
+        if let state = originalDockAutohide {
+            setDockAutohide(state)
+            originalDockAutohide = nil
+        }
+        if let delay = originalDockAutohideDelay {
+            setDockAutohideDelay(delay)
+            originalDockAutohideDelay = nil
+        } else {
+            let task = Process()
+            task.launchPath = "/usr/bin/defaults"
+            task.arguments = ["delete", "com.apple.dock", "autohide-delay"]
+            try? task.run()
+            task.waitUntilExit()
+        }
+        restartDock()
+        
+        // Remove crash-recovery agent
+        removeDockRestoreAgent()
+    }
+    
+    private func installDockRestoreAgent() {
+        let label = "annotate.GinBar.DockRestore"
+        let plistPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(label).plist")
+        
+        let plist: [String: Any] = [
+            "Label": label,
+            "ProgramArguments": [
+                "/bin/sh",
+                "-c",
+                """
+                sleep 5
+                if ! pgrep -x "GinBar" > /dev/null; then
+                    defaults write com.apple.dock autohide-delay -float 0
+                    defaults write com.apple.dock autohide -bool false
+                    killall Dock
+                    launchctl unload ~/Library/LaunchAgents/\(label).plist
+                    rm ~/Library/LaunchAgents/\(label).plist
+                fi
+                """
+            ],
+            "StartInterval": 10,
+            "RunAtLoad": true
+        ]
+        
+        (plist as NSDictionary).write(to: plistPath, atomically: true)
+        
+        let task = Process()
+        task.launchPath = "/bin/launchctl"
+        task.arguments = ["load", plistPath.path]
+        try? task.run()
+    }
+    
+    private func removeDockRestoreAgent() {
+        let label = "annotate.GinBar.DockRestore"
+        let plistPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(label).plist")
+        
+        let task = Process()
+        task.launchPath = "/bin/launchctl"
+        task.arguments = ["unload", plistPath.path]
+        try? task.run()
+        task.waitUntilExit()
+        try? FileManager.default.removeItem(at: plistPath)
+        
+        let stateURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("GinBar/dockRestore.plist")
+        try? FileManager.default.removeItem(at: stateURL)
+    }
+    
+    private func dockAutohide() -> Bool {
+        guard let val = CFPreferencesCopyAppValue("autohide" as CFString, "com.apple.dock" as CFString) as? Int else {
+            return false
+        }
+        return val != 0
+    }
+    
+    private func dockAutohideDelay() -> Float {
+        guard let val = CFPreferencesCopyAppValue("autohide-delay" as CFString, "com.apple.dock" as CFString) as? NSNumber else {
+            return 0
+        }
+        return val.floatValue
+    }
+    
+    private func setDockAutohide(_ value: Bool) {
+        CFPreferencesSetAppValue("autohide" as CFString, value ? 1 as CFNumber : 0 as CFNumber, "com.apple.dock" as CFString)
+        CFPreferencesAppSynchronize("com.apple.dock" as CFString)
+    }
+    
+    private func setDockAutohideDelay(_ value: Float) {
+        let num = NSNumber(value: value)
+        CFPreferencesSetAppValue("autohide-delay" as CFString, num, "com.apple.dock" as CFString)
+        CFPreferencesAppSynchronize("com.apple.dock" as CFString)
+    }
+    
+    private func restartDock() {
+        let task = Process()
+        task.launchPath = "/usr/bin/killall"
+        task.arguments = ["Dock"]
+        try? task.run()
+    }
+    
+    @objc private func willTerminate() {
+        restoreSystemDock()
+        for (_, obs) in axObservers {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .defaultMode)
+        }
+        axObservers.removeAll()
+        axCleanupTimer?.invalidate()
     }
     
     @objc private func appLaunchedForAdjust(_ notification: Notification) {
