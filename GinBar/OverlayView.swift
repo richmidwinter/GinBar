@@ -63,15 +63,35 @@ struct AppItemView: View {
         .background(isActive ? Color.white.opacity(0.15) : Color.clear)
         .cornerRadius(4)
         .contentShape(Rectangle())
-        .onHover { hovering in
-            if hovering {
-                windowManager.cancelHidePopupTimer()
-                windowManager.selectedApp = app
-            } else {
-                windowManager.scheduleHidePopup()
+        .overlay(
+            GeometryReader { geo in
+                Color.clear
+                    .onHover { hovering in
+                        if hovering {
+                            windowManager.cancelHidePopupTimer()
+                            windowManager.selectedApp = app
+                            let frame = geo.frame(in: .global)
+                            if let barWindow = NSApp.windows.first(where: { $0.level == .statusBar + 1 }) {
+                                NotificationCenter.default.post(
+                                    name: .appChipHovered,
+                                    object: nil,
+                                    userInfo: [
+                                        "screenMinX": barWindow.frame.minX,
+                                        "localMinX": frame.minX
+                                    ]
+                                )
+                            }
+                        } else {
+                            windowManager.scheduleHidePopup()
+                        }
+                    }
             }
-        }
+        )
     }
+}
+
+extension Notification.Name {
+    static let appChipHovered = Notification.Name("appChipHovered")
 }
 
 struct WindowPreviewPopup: View {
@@ -93,7 +113,9 @@ struct WindowPreviewPopup: View {
                     }
                 }
             }
-            .padding(12)
+            .padding(.top, 12)
+            .padding(.bottom, 12)
+            .padding(.trailing, 12)
             .background(
                 RoundedRectangle(cornerRadius: 8)
                     .fill(Color.black.opacity(0.6))

@@ -45,6 +45,13 @@ class OverlayManager {
             name: NSApplication.willTerminateNotification,
             object: nil
         )
+        
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(chipFrameUpdated(_:)),
+            name: .appChipHovered,
+            object: nil
+        )
 
         state.$isEnabled
             .sink { [weak self] _ in
@@ -144,7 +151,6 @@ class OverlayManager {
         let view = WindowPreviewPopup(windowManager: WindowManager.shared)
             .frame(height: popupHeight)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 8)
             .padding(.bottom, 4)
         let hosting = NSHostingView(rootView: view)
         hosting.frame = NSRect(x: 0, y: 0, width: frame.width, height: frame.height)
@@ -178,6 +184,31 @@ class OverlayManager {
                 }
             }
             .store(in: &cancellables)
+    }
+    
+    @objc private func chipFrameUpdated(_ notification: Notification) {
+        guard let screenMinX = notification.userInfo?["screenMinX"] as? CGFloat,
+              let localMinX = notification.userInfo?["localMinX"] as? CGFloat else { return }
+        let chipMinX = screenMinX + localMinX
+        
+        let barHeight = NSStatusBar.system.thickness + 4
+        let popupHeight: CGFloat = 140
+        
+        for (screen, window) in popupWindows {
+            guard chipMinX >= screen.frame.minX && chipMinX < screen.frame.maxX else { continue }
+            let popupWidth = max(200, screen.frame.maxX - chipMinX)
+            let newFrame = NSRect(
+                x: chipMinX,
+                y: screen.frame.minY + barHeight - 4,
+                width: popupWidth,
+                height: popupHeight + 4
+            )
+            window.setFrame(newFrame, display: true)
+            if let hosting = window.contentView {
+                hosting.frame = NSRect(x: 0, y: 0, width: popupWidth, height: popupHeight + 4)
+            }
+            break
+        }
     }
     
     func cleanup() {
