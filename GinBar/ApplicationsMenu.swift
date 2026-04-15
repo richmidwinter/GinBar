@@ -231,7 +231,7 @@ struct ApplicationsMenuContent: View {
         .frame(width: 220)
         .background(
             RoundedRectangle(cornerRadius: 8)
-                .fill(Color.black.opacity(0.85))
+                .fill(Color.black.opacity(0.4))
                 .overlay(.ultraThinMaterial)
         )
     }
