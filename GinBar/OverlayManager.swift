@@ -61,6 +61,7 @@ class OverlayManager {
                 self.updateScreens()
                 self.updateVisibility()
             }
+            WindowManager.shared.startAdjustingWindowsForBar(barHeight: NSStatusBar.system.thickness + 4)
         }
     }
     

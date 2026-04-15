@@ -34,6 +34,9 @@ class WindowManager: ObservableObject {
     
     private var timer: Timer?
     private var hidePopupTimer: Timer?
+    private var adjustTimer: Timer?
+    private var hasPromptedForAccessibility = false
+    private var barHeight: CGFloat = 0
     private var cancellables = Set<AnyCancellable>()
     
     var isRunningInPreview: Bool {
@@ -72,6 +75,11 @@ class WindowManager: ObservableObject {
     deinit {
         timer?.invalidate()
         hidePopupTimer?.invalidate()
+        axCleanupTimer?.invalidate()
+        for (_, obs) in axObservers {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .defaultMode)
+        }
+        axObservers.removeAll()
     }
     
     func scheduleHidePopup() {
@@ -245,6 +253,155 @@ class WindowManager: ObservableObject {
         selectedApp = current
     }
     
+    // MARK: - Bar spacing via AX observers
+    
+    private var axObservers: [pid_t: AXObserver] = [:]
+    private var axCleanupTimer: Timer?
+    
+    func startAdjustingWindowsForBar(barHeight: CGFloat) {
+        guard !isRunningInPreview else { return }
+        self.barHeight = barHeight
+        setupAXObservers()
+        adjustWindowsForBar()
+        
+        axCleanupTimer?.invalidate()
+        axCleanupTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.adjustWindowsForBar()
+            }
+        }
+        
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appLaunchedForAdjust(_:)),
+            name: NSWorkspace.didLaunchApplicationNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appTerminatedForAdjust(_:)),
+            name: NSWorkspace.didTerminateApplicationNotification,
+            object: nil
+        )
+    }
+    
+    @objc private func appLaunchedForAdjust(_ notification: Notification) {
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+              app.activationPolicy == .regular else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.addObserver(pid: app.processIdentifier)
+            self?.adjustWindowsForBar()
+        }
+    }
+    
+    @objc private func appTerminatedForAdjust(_ notification: Notification) {
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+        removeObserver(pid: app.processIdentifier)
+    }
+    
+    private func setupAXObservers() {
+        let ourPID = ProcessInfo.processInfo.processIdentifier
+        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+            guard app.processIdentifier != ourPID else { continue }
+            addObserver(pid: app.processIdentifier)
+        }
+    }
+    
+    private func addObserver(pid: pid_t) {
+        guard axObservers[pid] == nil else { return }
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false]
+        guard AXIsProcessTrustedWithOptions(options as CFDictionary) else { return }
+        
+        var observer: AXObserver?
+        let refcon = Unmanaged.passUnretained(WindowManager.shared).toOpaque()
+        let err = AXObserverCreate(pid, windowManagerAXCallback, &observer)
+        guard err == .success, let obs = observer else { return }
+        
+        let appRef = AXUIElementCreateApplication(pid)
+        AXObserverAddNotification(obs, appRef, kAXWindowCreatedNotification as CFString, refcon)
+        AXObserverAddNotification(obs, appRef, kAXWindowResizedNotification as CFString, refcon)
+        AXObserverAddNotification(obs, appRef, kAXWindowMovedNotification as CFString, refcon)
+        
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .defaultMode)
+        axObservers[pid] = obs
+    }
+    
+    private func removeObserver(pid: pid_t) {
+        guard let obs = axObservers.removeValue(forKey: pid) else { return }
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .defaultMode)
+    }
+    
+    func adjustWindowsForBar() {
+        guard barHeight > 0 else { return }
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false]
+        guard AXIsProcessTrustedWithOptions(options as CFDictionary) else { return }
+        
+        let ourPID = ProcessInfo.processInfo.processIdentifier
+        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+            guard app.processIdentifier != ourPID else { continue }
+            let appRef = AXUIElementCreateApplication(app.processIdentifier)
+            var value: AnyObject?
+            guard AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &value) == .success,
+                  let windows = value as? [AXUIElement] else { continue }
+            for window in windows {
+                adjustAXWindow(window)
+            }
+        }
+    }
+    
+    fileprivate func adjustAXWindow(_ window: AXUIElement) {
+        var minimizedRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute as CFString, &minimizedRef)
+        if let minimized = minimizedRef,
+           CFGetTypeID(minimized) == CFBooleanGetTypeID(),
+           CFBooleanGetValue((minimized as! CFBoolean)) {
+            return
+        }
+        
+        var posValue: CFTypeRef?
+        var sizeValue: CFTypeRef?
+        let posResult = AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &posValue)
+        let sizeResult = AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeValue)
+        guard posResult == .success, sizeResult == .success,
+              let posValue = posValue, let sizeValue = sizeValue else { return }
+        
+        var pos = CGPoint.zero
+        var size = CGSize.zero
+        AXValueGetValue(posValue as! AXValue, .cgPoint, &pos)
+        AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
+        
+        let windowBottom = pos.y + size.height
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        
+        for screen in NSScreen.screens {
+            let boundsTL = topLeftBounds(for: screen, primaryHeight: primaryHeight)
+            let barTopY = boundsTL.maxY - barHeight
+            
+            guard pos.x < boundsTL.maxX,
+                  pos.x + size.width > boundsTL.minX,
+                  pos.y < boundsTL.maxY,
+                  windowBottom > barTopY else { continue }
+            
+            let overlap = windowBottom - barTopY
+            guard overlap > 1 else { continue }
+            
+            let newHeight = max(100, size.height - overlap)
+            guard abs(newHeight - size.height) > 0.5 else { continue }
+            
+            var newSize = size
+            newSize.height = newHeight
+            if let v = AXValueCreate(.cgSize, &newSize) {
+                AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, v)
+            }
+            break
+        }
+    }
+    
+    private func topLeftBounds(for screen: NSScreen, primaryHeight: CGFloat) -> CGRect {
+        let y = primaryHeight - screen.frame.maxY
+        return CGRect(x: screen.frame.minX, y: y, width: screen.frame.width, height: screen.frame.height)
+    }
+    
     func focusWindow(_ window: WindowInfo) {
         guard !isRunningInPreview else { return }
         guard let app = NSRunningApplication(processIdentifier: window.pid) else { return }
@@ -293,5 +450,13 @@ class WindowManager: ObservableObject {
         if let appleScript = NSAppleScript(source: script) {
             appleScript.executeAndReturnError(&error)
         }
+    }
+}
+
+private let windowManagerAXCallback: @convention(c) (AXObserver, AXUIElement, CFString, UnsafeMutableRawPointer?) -> Void = { observer, element, notification, refcon in
+    guard let refcon = refcon else { return }
+    let manager = Unmanaged<WindowManager>.fromOpaque(refcon).takeUnretainedValue()
+    MainActor.assumeIsolated {
+        manager.adjustAXWindow(element)
     }
 }
