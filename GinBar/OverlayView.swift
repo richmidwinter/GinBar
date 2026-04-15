@@ -145,9 +145,8 @@ struct WindowThumbnailView: View {
     var body: some View {
         VStack(spacing: 4) {
             if let thumbnail = windowManager.thumbnails[window.id] {
-                Image(nsImage: thumbnail)
+                Image(nsImage: topCroppedImage(thumbnail, to: NSSize(width: 160, height: 100)))
                     .resizable()
-                    .scaledToFit()
                     .frame(width: 160, height: 100)
                     .cornerRadius(4)
                     .overlay(
@@ -209,4 +208,48 @@ struct WindowThumbnailView: View {
     private func loadThumbnail() {
         _ = windowManager.captureThumbnail(for: window.id)
     }
+}
+
+extension NSImage {
+    var bestCGImage: CGImage? {
+        if let cgImage = self.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            return cgImage
+        }
+        guard let tiffData = self.tiffRepresentation,
+              let source = CGImageSourceCreateWithData(tiffData as CFData, nil) else {
+            return nil
+        }
+        return CGImageSourceCreateImageAtIndex(source, 0, nil)
+    }
+}
+
+func topCroppedImage(_ image: NSImage, to targetSize: NSSize) -> NSImage {
+    guard let cgImage = image.bestCGImage else { return image }
+    
+    let width = Int(targetSize.width)
+    let height = Int(targetSize.height)
+    
+    guard let context = CGContext(
+        data: nil,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: 0,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else { return image }
+    
+    let imgSize = image.size
+    let scale = targetSize.width / imgSize.width
+    let scaledHeight = imgSize.height * scale
+    
+    let drawRect = CGRect(x: 0, y: CGFloat(height) - scaledHeight, width: targetSize.width, height: scaledHeight)
+    context.interpolationQuality = .high
+    context.draw(cgImage, in: drawRect)
+    
+    guard let newCGImage = context.makeImage() else { return image }
+    let bitmapRep = NSBitmapImageRep(cgImage: newCGImage)
+    let newImage = NSImage(size: targetSize)
+    newImage.addRepresentation(bitmapRep)
+    return newImage
 }

@@ -56,6 +56,9 @@ class WindowManager: ObservableObject {
     }
     
     init() {
+        // Clear stale cached thumbnails from old aspect-ratio bugs
+        thumbnails.removeAll()
+        
         if isRunningInPreview {
             permissionStatus = .granted
         } else {
@@ -218,9 +221,14 @@ class WindowManager: ObservableObject {
             }
             
             let filter = SCContentFilter(desktopIndependentWindow: scWindow)
+            let scFrame = scWindow.frame
+            let aspectRatio = scFrame.width / max(scFrame.height, 1)
+            let captureWidth: CGFloat = 320
+            let captureHeight = captureWidth / aspectRatio
+            
             let config = SCStreamConfiguration()
-            config.width = 320
-            config.height = 200
+            config.width = Int(captureWidth)
+            config.height = Int(captureHeight)
             config.scalesToFit = true
             config.backgroundColor = .clear
             
@@ -229,7 +237,7 @@ class WindowManager: ObservableObject {
                 configuration: config
             )
             
-            let nsImage = NSImage(cgImage: image, size: NSSize(width: 160, height: 100))
+            let nsImage = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
             
             await MainActor.run {
                 self.thumbnails[windowID] = nsImage
