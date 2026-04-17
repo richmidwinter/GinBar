@@ -3,8 +3,8 @@ import Combine
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Show in Dock so user can quit via right-click
-        NSApp.setActivationPolicy(.regular)
+        // Accessory policy (no Dock icon), matching boringBar
+        NSApp.setActivationPolicy(.accessory)
         
         // Hide the main SwiftUI window (not overlay windows which are borderless)
         for window in NSApp.windows {
@@ -28,7 +28,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ) { _ in
             print("[GinBar] Terminating - closing all windows")
             for window in NSApp.windows {
-                if window.styleMask == .borderless {
+                if window.styleMask.contains(.nonactivatingPanel) || window.styleMask == .borderless {
                     window.orderOut(nil)
                     window.close()
                 }

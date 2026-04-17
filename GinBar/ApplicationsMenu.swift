@@ -1,6 +1,11 @@
 import SwiftUI
 import AppKit
 
+final class MenuWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
 final class MenuWindowController {
     static let shared = MenuWindowController()
     
@@ -15,7 +20,7 @@ final class MenuWindowController {
         
         guard let screen = button.window?.screen ?? NSScreen.main else { return }
         let barHeight = NSStatusBar.system.thickness + 4
-        let menuHeight = min(CGFloat(applications.count * 28) + 16, 500)
+        let menuHeight = min(CGFloat(applications.count * 28) + 16 + 40, 540)
         let frame = NSRect(
             x: screen.frame.minX,
             y: screen.frame.minY + barHeight,
@@ -32,7 +37,7 @@ final class MenuWindowController {
         hosting.frame = NSRect(origin: .zero, size: frame.size)
         
         if window == nil {
-            let w = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+            let w = MenuWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
             w.level = NSWindow.Level.statusBar + 2
             w.isOpaque = false
             w.backgroundColor = .clear
@@ -44,7 +49,7 @@ final class MenuWindowController {
         }
         
         window?.contentView = hosting
-        window?.orderFront(nil)
+        window?.makeKeyAndOrderFront(nil)
         
         monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             self?.hide()
@@ -191,42 +196,68 @@ struct ApplicationsMenuContent: View {
     let applications: [URL]
     let onSelect: (URL) -> Void
     @State private var hoveredURL: URL?
+    @State private var searchText: String = ""
+    
+    private var filteredApplications: [URL] {
+        if searchText.isEmpty { return applications }
+        return applications.filter {
+            $0.deletingPathExtension().lastPathComponent.localizedCaseInsensitiveContains(searchText)
+        }
+    }
     
     var body: some View {
-        ScrollView(.vertical, showsIndicators: true) {
-            VStack(alignment: .leading, spacing: 2) {
-                ForEach(applications, id: \.self) { url in
-                    Button(action: {
-                        onSelect(url)
-                    }) {
-                        HStack(spacing: 8) {
-                            let icon = NSWorkspace.shared.icon(forFile: url.path)
-                            Image(nsImage: icon)
-                                .resizable()
-                                .scaledToFit()
-                                .frame(width: 16, height: 16)
-                            
-                            Text(url.deletingPathExtension().lastPathComponent)
-                                .font(.system(size: 13))
-                                .foregroundColor(.white)
-                            
-                            Spacer()
+        VStack(spacing: 0) {
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(filteredApplications, id: \.self) { url in
+                        Button(action: {
+                            onSelect(url)
+                        }) {
+                            HStack(spacing: 8) {
+                                let icon = NSWorkspace.shared.icon(forFile: url.path)
+                                Image(nsImage: icon)
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(width: 16, height: 16)
+                                
+                                Text(url.deletingPathExtension().lastPathComponent)
+                                    .font(.system(size: 13))
+                                    .foregroundColor(.white)
+                                
+                                Spacer()
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .contentShape(Rectangle())
+                            .background(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .fill(hoveredURL == url ? Color.white.opacity(0.15) : Color.clear)
+                            )
                         }
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .contentShape(Rectangle())
-                        .background(
-                            RoundedRectangle(cornerRadius: 4)
-                                .fill(hoveredURL == url ? Color.white.opacity(0.15) : Color.clear)
-                        )
-                    }
-                    .buttonStyle(PlainButtonStyle())
-                    .onHover { hovering in
-                        hoveredURL = hovering ? url : nil
+                        .buttonStyle(PlainButtonStyle())
+                        .onHover { hovering in
+                            hoveredURL = hovering ? url : nil
+                        }
                     }
                 }
+                .padding(.vertical, 8)
             }
-            .padding(.vertical, 8)
+            
+            Divider()
+                .background(Color.white.opacity(0.2))
+            
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundColor(.white.opacity(0.6))
+                    .font(.system(size: 12))
+                
+                TextField("Search applications...", text: $searchText)
+                    .font(.system(size: 13))
+                    .textFieldStyle(PlainTextFieldStyle())
+                    .foregroundColor(.white)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
         }
         .frame(width: 220)
         .background(

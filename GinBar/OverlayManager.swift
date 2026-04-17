@@ -2,12 +2,54 @@ import Cocoa
 import SwiftUI
 import Combine
 
+private typealias SLSMainConnectionIDFunc = @convention(c) () -> Int32
+private typealias SLSCopyManagedDisplaySpacesFunc = @convention(c) (Int32) -> Unmanaged<CFArray>?
+private typealias SLSAddWindowsToSpacesFunc = @convention(c) (Int32, CFArray, CFArray) -> Int32
+private typealias SLSRemoveWindowsFromSpacesFunc = @convention(c) (Int32, CFArray, CFArray) -> Int32
+private typealias SLSManagedDisplaySetCurrentSpaceFunc = @convention(c) (Int32, CFString, UInt64) -> Int32
+
+private struct SkyLightAPIs {
+    static let shared = SkyLightAPIs()
+    
+    let mainConnectionID: SLSMainConnectionIDFunc?
+    let copyManagedDisplaySpaces: SLSCopyManagedDisplaySpacesFunc?
+    let addWindowsToSpaces: SLSAddWindowsToSpacesFunc?
+    let removeWindowsFromSpaces: SLSRemoveWindowsFromSpacesFunc?
+    let managedDisplaySetCurrentSpace: SLSManagedDisplaySetCurrentSpaceFunc?
+    
+    init() {
+        guard let handle = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW) else {
+            self.mainConnectionID = nil
+            self.copyManagedDisplaySpaces = nil
+            self.addWindowsToSpaces = nil
+            self.removeWindowsFromSpaces = nil
+            self.managedDisplaySetCurrentSpace = nil
+            return
+        }
+        self.mainConnectionID = unsafeBitCast(dlsym(handle, "SLSMainConnectionID"), to: SLSMainConnectionIDFunc.self)
+        self.copyManagedDisplaySpaces = unsafeBitCast(dlsym(handle, "SLSCopyManagedDisplaySpaces"), to: SLSCopyManagedDisplaySpacesFunc.self)
+        self.addWindowsToSpaces = unsafeBitCast(dlsym(handle, "SLSAddWindowsToSpaces"), to: SLSAddWindowsToSpacesFunc.self)
+        self.removeWindowsFromSpaces = unsafeBitCast(dlsym(handle, "SLSRemoveWindowsFromSpaces"), to: SLSRemoveWindowsFromSpacesFunc.self)
+        self.managedDisplaySetCurrentSpace = unsafeBitCast(dlsym(handle, "SLSManagedDisplaySetCurrentSpace"), to: SLSManagedDisplaySetCurrentSpaceFunc.self)
+    }
+}
+
+final class BarWindow: NSPanel {
+    var allowBecomeKey: Bool = false
+    override var canBecomeKey: Bool { allowBecomeKey }
+    override var canBecomeMain: Bool { allowBecomeKey }
+}
+
 class OverlayManager {
 
-    private var barWindows: [NSScreen: NSWindow] = [:]
+    private var barWindows: [UInt64: NSWindow] = [:]
+    private var spaceScreenMap: [UInt64: NSScreen] = [:]
+    private var spaceCurrentSpaceMap: [UInt64: UInt64] = [:]
+    private var spaceDisplayUUIDMap: [UInt64: String] = [:]
     private var popupWindows: [NSScreen: NSWindow] = [:]
     private weak var state: AppState?
     private var cancellables = Set<AnyCancellable>()
+    private let sls = SkyLightAPIs.shared
     
     private var isRunningInPreview: Bool {
         let env = ProcessInfo.processInfo.environment
@@ -32,6 +74,10 @@ class OverlayManager {
         
         guard !isRunningInPreview else { return }
 
+        WindowManager.shared.onSwitchToSpace = { [weak self] spaceID in
+            self?.switchToSpace(spaceID)
+        }
+
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(updateScreens),
@@ -52,7 +98,14 @@ class OverlayManager {
             name: .appChipHovered,
             object: nil
         )
-
+        
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(spaceDidChange),
+            name: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil
+        )
+        
         state.$isEnabled
             .sink { [weak self] _ in
                 self?.updateVisibility()
@@ -60,13 +113,11 @@ class OverlayManager {
             .store(in: &cancellables)
 
         updateScreens()
-        updateVisibility()
         
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self = self else { return }
             if self.barWindows.isEmpty {
                 self.updateScreens()
-                self.updateVisibility()
             }
             WindowManager.shared.startAdjustingWindowsForBar(barHeight: NSStatusBar.system.thickness + 4)
         }
@@ -77,25 +128,46 @@ class OverlayManager {
     }
 
     @objc func updateScreens() {
+        refreshSpaceBars()
+        
         for screen in NSScreen.screens {
-            if barWindows[screen] == nil {
-                createBarWindow(for: screen)
+            if popupWindows[screen] == nil {
                 createPopupWindow(for: screen)
             }
         }
-        updateVisibility()
+    }
+    
+    @objc private func spaceDidChange() {
+        refreshSpaceBars()
+        
+        // Show the bar for the current space after the transition completes.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            guard let copyFn = self.sls.copyManagedDisplaySpaces,
+                  let displays = copyFn(self.sls.mainConnectionID?() ?? 0)?.takeRetainedValue() as? [NSDictionary] else { return }
+            
+            for display in displays {
+                guard let currentSpace = (display["Current Space"] as? NSDictionary)?["id64"] as? UInt64 else { continue }
+                if let window = self.barWindows[currentSpace] as? BarWindow {
+                    window.allowBecomeKey = true
+                    NSApp.activate(ignoringOtherApps: true)
+                    window.makeKeyAndOrderFront(nil)
+                    window.allowBecomeKey = false
+                }
+            }
+        }
     }
 
     private func updateVisibility() {
         guard let state = state else { return }
-        for window in barWindows.values {
+        for (_, window) in barWindows {
             if state.isEnabled {
                 window.orderFront(nil)
             } else {
                 window.orderOut(nil)
             }
         }
-        for window in popupWindows.values {
+        for (_, window) in popupWindows {
             if !state.isEnabled {
                 window.orderOut(nil)
                 window.ignoresMouseEvents = true
@@ -103,7 +175,83 @@ class OverlayManager {
         }
     }
 
-    private func createBarWindow(for screen: NSScreen) {
+    private func refreshSpaceBars() {
+        guard let copyFn = sls.copyManagedDisplaySpaces,
+              let displays = copyFn(sls.mainConnectionID?() ?? 0)?.takeRetainedValue() as? [NSDictionary] else { return }
+        
+        var newSpaceScreenMap: [UInt64: NSScreen] = [:]
+        var newSpaceCurrentSpaceMap: [UInt64: UInt64] = [:]
+        var newSpaceDisplayUUIDMap: [UInt64: String] = [:]
+        var currentSpaceIDs = Set<UInt64>()
+        
+        for display in displays {
+            guard let spacesArray = display["Spaces"] as? [NSDictionary] else { continue }
+            let screen = screenForDisplay(display)
+            let currentSpaceID = (display["Current Space"] as? NSDictionary)?["id64"] as? UInt64
+            let displayUUID = display["Display Identifier"] as? String
+            
+            for space in spacesArray {
+                if let id64 = space["id64"] as? UInt64 {
+                    currentSpaceIDs.insert(id64)
+                    newSpaceScreenMap[id64] = screen
+                    newSpaceCurrentSpaceMap[id64] = currentSpaceID
+                    if let uuid = displayUUID {
+                        newSpaceDisplayUUIDMap[id64] = uuid
+                    }
+                }
+            }
+        }
+        
+        spaceScreenMap = newSpaceScreenMap
+        spaceCurrentSpaceMap = newSpaceCurrentSpaceMap
+        spaceDisplayUUIDMap = newSpaceDisplayUUIDMap
+        
+        // Remove bars for spaces that no longer exist
+        for (spaceID, window) in barWindows {
+            if !currentSpaceIDs.contains(spaceID) {
+                window.orderOut(nil)
+                window.close()
+                barWindows.removeValue(forKey: spaceID)
+            }
+        }
+        
+        // Create bars sequentially to avoid overwhelming SwiftUI's graph engine
+        let spacesToCreate = currentSpaceIDs.filter { barWindows[$0] == nil }.sorted()
+        createNextBar(from: spacesToCreate, index: 0)
+    }
+    
+    private func createNextBar(from spaces: [UInt64], index: Int) {
+        guard index < spaces.count else {
+            updateVisibility()
+            return
+        }
+        
+        let spaceID = spaces[index]
+        if let screen = spaceScreenMap[spaceID] {
+            createBarWindow(for: spaceID, screen: screen)
+        }
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.createNextBar(from: spaces, index: index + 1)
+        }
+    }
+    
+    private func screenForDisplay(_ display: NSDictionary) -> NSScreen? {
+        guard let displayUUID = display["Display Identifier"] as? String else { return NSScreen.screens.first }
+        
+        for screen in NSScreen.screens {
+            guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { continue }
+            let displayID = screenNumber.uint32Value
+            guard let uuid = CGDisplayCreateUUIDFromDisplayID(displayID)?.takeRetainedValue() else { continue }
+            let uuidString = CFUUIDCreateString(nil, uuid) as String
+            if uuidString == displayUUID {
+                return screen
+            }
+        }
+        return NSScreen.screens.first
+    }
+
+    private func createBarWindow(for spaceID: UInt64, screen: NSScreen) {
         let barHeight = NSStatusBar.system.thickness + 4
         
         let frame = NSRect(
@@ -114,27 +262,68 @@ class OverlayManager {
         )
 
         guard let state = state else { return }
-        let view = BarView(barHeight: barHeight)
+        let view = BarView(barHeight: barHeight, spaceID: spaceID)
             .environmentObject(state)
         let hosting = NSHostingView(rootView: view)
         hosting.frame = NSRect(x: 0, y: 0, width: frame.width, height: frame.height)
 
-        let window = NSWindow(
+        let window = BarWindow(
             contentRect: frame,
-            styleMask: .borderless,
+            styleMask: .nonactivatingPanel,
             backing: .buffered,
             defer: false
         )
 
-        window.level = NSWindow.Level.statusBar + 1
+        window.level = .statusBar
         window.isOpaque = false
         window.backgroundColor = .clear
+        window.hasShadow = false
+        window.hidesOnDeactivate = false
+        window.isMovableByWindowBackground = false
+        window.animationBehavior = .documentWindow
+        window.acceptsMouseMovedEvents = true
         window.ignoresMouseEvents = false
-        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        window.becomesKeyOnlyIfNeeded = true
+        window.collectionBehavior = [.managed, .ignoresCycle, .fullScreenAuxiliary]
         window.contentView = hosting
-        window.makeKeyAndOrderFront(nil)
 
-        barWindows[screen] = window
+        barWindows[spaceID] = window
+        
+        // For the current space, show it immediately.
+        guard let currentSpace = spaceCurrentSpaceMap[spaceID], currentSpace != spaceID else {
+            window.orderFront(nil)
+            return
+        }
+        
+        // Assign to target space immediately while window is still fresh.
+        let windowNumber = window.windowNumber
+        if windowNumber > 0, let cid = self.sls.mainConnectionID?() {
+            var windowIDValue = Int32(windowNumber)
+            var targetSpaceValue = Int64(spaceID)
+            var currentSpaceValue = Int64(currentSpace)
+            
+            if let windowNum = CFNumberCreate(nil, .sInt32Type, &windowIDValue),
+               let targetNum = CFNumberCreate(nil, .sInt64Type, &targetSpaceValue),
+               let currentNum = CFNumberCreate(nil, .sInt64Type, &currentSpaceValue) {
+                let windowArray = [windowNum] as CFArray
+                let targetSpaceArray = [targetNum] as CFArray
+                let currentSpaceArray = [currentNum] as CFArray
+                
+                if let addFn = self.sls.addWindowsToSpaces {
+                    let addResult = addFn(cid, windowArray, targetSpaceArray)
+                    NSLog("[GinBar] SLSAddWindowsToSpaces space=%llu win=%d result=%d", spaceID, windowNumber, addResult)
+                    
+                    if addResult == 0, let removeFn = self.sls.removeWindowsFromSpaces {
+                        let removeResult = removeFn(cid, windowArray, currentSpaceArray)
+                        NSLog("[GinBar] SLSRemoveWindowsFromSpaces space=%llu current=%llu result=%d", spaceID, currentSpace, removeResult)
+                    }
+                }
+            }
+        }
+        
+        // Non-current space: hide the window. It will be shown via makeKeyAndOrderFront:
+        // when the user switches to this space.
+        window.orderOut(nil)
     }
     
     private func createPopupWindow(for screen: NSScreen) {
@@ -187,9 +376,10 @@ class OverlayManager {
     }
     
     @objc private func chipFrameUpdated(_ notification: Notification) {
-        guard let screenMinX = notification.userInfo?["screenMinX"] as? CGFloat,
-              let localMinX = notification.userInfo?["localMinX"] as? CGFloat else { return }
-        let chipMinX = screenMinX + localMinX
+        guard let spaceID = notification.userInfo?["spaceID"] as? UInt64,
+              let localMinX = notification.userInfo?["localMinX"] as? CGFloat,
+              let barWindow = barWindows[spaceID] else { return }
+        let chipMinX = barWindow.frame.minX + localMinX
         
         let barHeight = NSStatusBar.system.thickness + 4
         let popupHeight: CGFloat = 140
@@ -209,6 +399,22 @@ class OverlayManager {
             }
             break
         }
+    }
+    
+    func switchToSpace(_ spaceID: UInt64) {
+        if barWindows[spaceID] == nil {
+            if let screen = spaceScreenMap[spaceID] ?? NSScreen.screens.first {
+                createBarWindow(for: spaceID, screen: screen)
+            }
+        }
+        
+        guard let window = barWindows[spaceID] as? BarWindow else { return }
+        
+        // Temporarily allow the bar to become key, matching boringBar's allowBecomeKey trick.
+        window.allowBecomeKey = true
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.allowBecomeKey = false
     }
     
     func cleanup() {

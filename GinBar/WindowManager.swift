@@ -32,6 +32,8 @@ class WindowManager: ObservableObject {
     @Published var permissionStatus: CapturePermissionStatus = .unknown
     @Published var isPopupHovered: Bool = false
     
+    var onSwitchToSpace: ((UInt64) -> Void)?
+    
     private var timer: Timer?
     private var hidePopupTimer: Timer?
     private var adjustTimer: Timer?
@@ -120,7 +122,12 @@ class WindowManager: ObservableObject {
     }
     
     @objc private func spaceDidChange() {
+        selectedApp = nil // hide popup when switching spaces
         updateWindows()
+    }
+    
+    func switchToSpace(_ spaceID: UInt64) {
+        onSwitchToSpace?(spaceID)
     }
     
     func updateWindows() {

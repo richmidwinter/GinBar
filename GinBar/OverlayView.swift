@@ -2,9 +2,10 @@ import SwiftUI
 
 struct BarView: View {
     @EnvironmentObject var state: AppState
-    @StateObject private var dockManager = DockManager()
+    @ObservedObject private var dockManager = DockManager.shared
     @ObservedObject private var windowManager = WindowManager.shared
     let barHeight: CGFloat
+    let spaceID: UInt64
     
     var body: some View {
         HStack(spacing: 4) {
@@ -19,12 +20,17 @@ struct BarView: View {
                 AppItemView(
                     app: app,
                     isActive: app.isActive,
-                    windowManager: windowManager
+                    windowManager: windowManager,
+                    spaceID: spaceID
                 )
                 .onTapGesture {
                     dockManager.activateApp(app)
                 }
             }
+            
+            Spacer()
+            
+            SpacesMenu(spaceID: spaceID)
         }
         .padding(.horizontal, 8)
         .frame(maxWidth: .infinity, maxHeight: barHeight, alignment: .leading)
@@ -39,6 +45,7 @@ struct AppItemView: View {
     let app: NSRunningApplication
     let isActive: Bool
     @ObservedObject var windowManager: WindowManager
+    let spaceID: UInt64
     
     var body: some View {
         HStack(spacing: 4) {
@@ -57,6 +64,17 @@ struct AppItemView: View {
                 .font(.system(size: 12, weight: isActive ? .semibold : .regular))
                 .foregroundColor(isActive ? .white : .white.opacity(0.7))
                 .lineLimit(1)
+            
+            let count = windowManager.windows(for: app).count
+            if count > 1 {
+                Divider()
+                    .frame(height: 12)
+                    .background(Color.white.opacity(0.3))
+                
+                Text("\(count)")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.white.opacity(0.8))
+            }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
@@ -71,16 +89,14 @@ struct AppItemView: View {
                             windowManager.cancelHidePopupTimer()
                             windowManager.selectedApp = app
                             let frame = geo.frame(in: .global)
-                            if let barWindow = NSApp.windows.first(where: { $0.level == .statusBar + 1 }) {
-                                NotificationCenter.default.post(
-                                    name: .appChipHovered,
-                                    object: nil,
-                                    userInfo: [
-                                        "screenMinX": barWindow.frame.minX,
-                                        "localMinX": frame.minX
-                                    ]
-                                )
-                            }
+                            NotificationCenter.default.post(
+                                name: .appChipHovered,
+                                object: nil,
+                                userInfo: [
+                                    "spaceID": spaceID,
+                                    "localMinX": frame.minX
+                                ]
+                            )
                         } else {
                             windowManager.scheduleHidePopup()
                         }

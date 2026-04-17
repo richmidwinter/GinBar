@@ -3,6 +3,7 @@ import Combine
 
 @MainActor
 class DockManager: ObservableObject {
+    static let shared = DockManager()
     @Published var appsWithWindows: [NSRunningApplication] = []
     
     private var cancellables = Set<AnyCancellable>()
@@ -26,7 +27,7 @@ class DockManager: ObservableObject {
         return false
     }
     
-    init() {
+    private init() {
         guard !isRunningInPreview else { return }
         
         updateAppsWithWindows()
