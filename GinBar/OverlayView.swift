@@ -129,9 +129,8 @@ struct WindowPreviewPopup: View {
                     }
                 }
             }
-            .padding(.top, 12)
-            .padding(.bottom, 12)
-            .padding(.trailing, 12)
+            .padding(.vertical, 12)
+            .padding(.horizontal, 12)
             .background(
                 RoundedRectangle(cornerRadius: 8)
                     .fill(Color.black.opacity(0.6))
