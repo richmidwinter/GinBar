@@ -148,6 +148,7 @@ class OverlayManager {
             
             for display in displays {
                 guard let currentSpace = (display["Current Space"] as? NSDictionary)?["id64"] as? UInt64 else { continue }
+                WindowManager.shared.currentSpaceID = currentSpace
                 if let window = self.barWindows[currentSpace] as? BarWindow {
                     window.allowBecomeKey = true
                     NSApp.activate(ignoringOtherApps: true)
@@ -199,6 +200,10 @@ class OverlayManager {
                         newSpaceDisplayUUIDMap[id64] = uuid
                     }
                 }
+            }
+            // Set initial current space if not yet known
+            if WindowManager.shared.currentSpaceID == nil, let spaceID = currentSpaceID {
+                WindowManager.shared.currentSpaceID = spaceID
             }
         }
         

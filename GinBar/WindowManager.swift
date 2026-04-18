@@ -31,6 +31,7 @@ class WindowManager: ObservableObject {
     @Published var thumbnails: [CGWindowID: NSImage] = [:]
     @Published var permissionStatus: CapturePermissionStatus = .unknown
     @Published var isPopupHovered: Bool = false
+    @Published var currentSpaceID: UInt64?
     
     var onSwitchToSpace: ((UInt64) -> Void)?
     
@@ -42,6 +43,7 @@ class WindowManager: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var nextSyntheticID: CGWindowID = 0xFFFF0000
     private var syntheticWindows: [String: WindowInfo] = [:]
+    private var windowSpaceCache: [String: UInt64] = [:]
     
     var isRunningInPreview: Bool {
         let env = ProcessInfo.processInfo.environment
@@ -189,6 +191,14 @@ class WindowManager: ObservableObject {
         }
         
         self.windows = newWindows.sorted { $0.layer < $1.layer }
+        
+        // Cache visible windows to current space for minimized window tracking
+        if let spaceID = currentSpaceID {
+            for window in windows {
+                let key = "\(window.pid):\(window.title)"
+                windowSpaceCache[key] = spaceID
+            }
+        }
     }
     
     func windows(for app: NSRunningApplication) -> [WindowInfo] {
@@ -210,6 +220,15 @@ class WindowManager: ObservableObject {
             var titleRef: CFTypeRef?
             AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleRef)
             let title = (titleRef as? String) ?? ""
+            
+            // Filter minimized windows by current space
+            if let currentSpace = currentSpaceID {
+                let key = "\(app.processIdentifier):\(title)"
+                if let cachedSpace = windowSpaceCache[key], cachedSpace != currentSpace {
+                    continue
+                }
+                // If not in cache, include as fallback
+            }
             
             // Skip if already in the visible list
             if result.contains(where: { $0.title == title }) { continue }
@@ -236,6 +255,10 @@ class WindowManager: ObservableObject {
         }
         
         return result
+    }
+    
+    func spaceIDForMinimizedWindow(pid: pid_t, title: String) -> UInt64? {
+        return windowSpaceCache["\(pid):\(title)"]
     }
     
     func thumbnailStatus(for windowID: CGWindowID) -> String {

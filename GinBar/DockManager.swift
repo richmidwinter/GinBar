@@ -71,19 +71,36 @@ class DockManager: ObservableObject {
                 && app.activationPolicy == .regular
         }
         
-        // Also include apps that have minimized windows (no visible windows)
+        // Also include apps that have minimized windows on the current space
         for app in allApps where !currentPIDs.contains(app.processIdentifier) {
             let appEl = AXUIElementCreateApplication(app.processIdentifier)
             var value: AnyObject?
             guard AXUIElementCopyAttributeValue(appEl, kAXWindowsAttribute as CFString, &value) == .success,
                   let axWindows = value as? [AXUIElement] else { continue }
+            var hasMinimizedOnCurrentSpace = false
             for axWindow in axWindows {
                 var minimizedRef: CFTypeRef?
                 AXUIElementCopyAttributeValue(axWindow, kAXMinimizedAttribute as CFString, &minimizedRef)
                 if let minimized = minimizedRef, CFGetTypeID(minimized) == CFBooleanGetTypeID(), CFBooleanGetValue(minimized as! CFBoolean) {
-                    currentPIDs.insert(app.processIdentifier)
-                    break
+                    var titleRef: CFTypeRef?
+                    AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleRef)
+                    let title = (titleRef as? String) ?? ""
+                    
+                    if let currentSpace = WindowManager.shared.currentSpaceID,
+                       let cachedSpace = WindowManager.shared.spaceIDForMinimizedWindow(pid: app.processIdentifier, title: title) {
+                        if cachedSpace == currentSpace {
+                            hasMinimizedOnCurrentSpace = true
+                            break
+                        }
+                    } else {
+                        // Unknown space, include as fallback
+                        hasMinimizedOnCurrentSpace = true
+                        break
+                    }
                 }
+            }
+            if hasMinimizedOnCurrentSpace {
+                currentPIDs.insert(app.processIdentifier)
             }
         }
         
