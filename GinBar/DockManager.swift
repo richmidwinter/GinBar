@@ -53,7 +53,7 @@ class DockManager: ObservableObject {
             return
         }
         
-        // Get current PIDs
+        // Get current PIDs from visible windows
         var currentPIDs = Set<pid_t>()
         for windowDict in windowList {
             if let ownerPID = windowDict[kCGWindowOwnerPID as String] as? pid_t {
@@ -69,6 +69,22 @@ class DockManager: ObservableObject {
             }
             return app.processIdentifier != ProcessInfo.processInfo.processIdentifier 
                 && app.activationPolicy == .regular
+        }
+        
+        // Also include apps that have minimized windows (no visible windows)
+        for app in allApps where !currentPIDs.contains(app.processIdentifier) {
+            let appEl = AXUIElementCreateApplication(app.processIdentifier)
+            var value: AnyObject?
+            guard AXUIElementCopyAttributeValue(appEl, kAXWindowsAttribute as CFString, &value) == .success,
+                  let axWindows = value as? [AXUIElement] else { continue }
+            for axWindow in axWindows {
+                var minimizedRef: CFTypeRef?
+                AXUIElementCopyAttributeValue(axWindow, kAXMinimizedAttribute as CFString, &minimizedRef)
+                if let minimized = minimizedRef, CFGetTypeID(minimized) == CFBooleanGetTypeID(), CFBooleanGetValue(minimized as! CFBoolean) {
+                    currentPIDs.insert(app.processIdentifier)
+                    break
+                }
+            }
         }
         
         let candidateApps = allApps.filter { app in

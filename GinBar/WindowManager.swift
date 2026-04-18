@@ -40,6 +40,8 @@ class WindowManager: ObservableObject {
     private var hasPromptedForAccessibility = false
     private var barHeight: CGFloat = 0
     private var cancellables = Set<AnyCancellable>()
+    private var nextSyntheticID: CGWindowID = 0xFFFF0000
+    private var syntheticWindows: [String: WindowInfo] = [:]
     
     var isRunningInPreview: Bool {
         let env = ProcessInfo.processInfo.environment
@@ -170,13 +172,15 @@ class WindowManager: ObservableObject {
                 height: bounds["Height"] ?? 0
             )
             
+            let isOnScreen = windowDict[kCGWindowIsOnscreen as String] as? Bool ?? false
+            
             let info = WindowInfo(
                 id: windowNumber,
                 pid: ownerPID,
                 appName: ownerName,
                 title: title,
                 frame: frame,
-                isOnScreen: true,
+                isOnScreen: isOnScreen,
                 layer: layer,
                 alpha: alpha
             )
@@ -188,7 +192,50 @@ class WindowManager: ObservableObject {
     }
     
     func windows(for app: NSRunningApplication) -> [WindowInfo] {
-        windows.filter { $0.pid == app.processIdentifier && $0.isOnScreen }
+        var result = windows.filter { $0.pid == app.processIdentifier }
+        
+        // Also include minimized windows via Accessibility API
+        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
+              let axWindows = value as? [AXUIElement] else {
+            return result
+        }
+        
+        for axWindow in axWindows {
+            var minimizedRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(axWindow, kAXMinimizedAttribute as CFString, &minimizedRef)
+            guard let minimized = minimizedRef, CFGetTypeID(minimized) == CFBooleanGetTypeID(), CFBooleanGetValue(minimized as! CFBoolean) else { continue }
+            
+            var titleRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleRef)
+            let title = (titleRef as? String) ?? ""
+            
+            // Skip if already in the visible list
+            if result.contains(where: { $0.title == title }) { continue }
+            
+            let key = "\(app.processIdentifier):\(title)"
+            if let cached = syntheticWindows[key] {
+                result.append(cached)
+            } else {
+                let id = nextSyntheticID
+                nextSyntheticID += 1
+                let info = WindowInfo(
+                    id: id,
+                    pid: app.processIdentifier,
+                    appName: app.localizedName ?? "",
+                    title: title,
+                    frame: .zero,
+                    isOnScreen: false,
+                    layer: 0,
+                    alpha: 1.0
+                )
+                syntheticWindows[key] = info
+                result.append(info)
+            }
+        }
+        
+        return result
     }
     
     func thumbnailStatus(for windowID: CGWindowID) -> String {
@@ -575,27 +622,43 @@ class WindowManager: ObservableObject {
         var value: AnyObject?
         let result = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value)
         
-        if result == .success, let axWindows = value as? [AXUIElement] {
+        guard result == .success, let axWindows = value as? [AXUIElement] else {
+            return
+        }
+        
+        // Synthetic IDs (>= 0xFFFF0000) are minimized windows — find by title
+        if window.id >= 0xFFFF0000 {
             for axWindow in axWindows {
-                var positionRef: CFTypeRef?
-                var sizeRef: CFTypeRef?
-                AXUIElementCopyAttributeValue(axWindow, kAXPositionAttribute as CFString, &positionRef)
-                AXUIElementCopyAttributeValue(axWindow, kAXSizeAttribute as CFString, &sizeRef)
+                var titleRef: CFTypeRef?
+                AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleRef)
+                let title = (titleRef as? String) ?? ""
+                if title == window.title {
+                    AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
+                    return
+                }
+            }
+            return
+        }
+        
+        for axWindow in axWindows {
+            var positionRef: CFTypeRef?
+            var sizeRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(axWindow, kAXPositionAttribute as CFString, &positionRef)
+            AXUIElementCopyAttributeValue(axWindow, kAXSizeAttribute as CFString, &sizeRef)
+            
+            if let positionRef = positionRef, let sizeRef = sizeRef {
+                var position = CGPoint.zero
+                var size = CGSize.zero
+                AXValueGetValue(positionRef as! AXValue, .cgPoint, &position)
+                AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
+                let axFrame = CGRect(origin: position, size: size)
                 
-                if let positionRef = positionRef, let sizeRef = sizeRef {
-                    var position = CGPoint.zero
-                    var size = CGSize.zero
-                    AXValueGetValue(positionRef as! AXValue, .cgPoint, &position)
-                    AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
-                    let axFrame = CGRect(origin: position, size: size)
-                    
-                    if abs(axFrame.minX - window.frame.minX) < 5 &&
-                       abs(axFrame.minY - window.frame.minY) < 5 &&
-                       abs(axFrame.width - window.frame.width) < 5 &&
-                       abs(axFrame.height - window.frame.height) < 5 {
-                        AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
-                        return
-                    }
+                if abs(axFrame.minX - window.frame.minX) < 5 &&
+                   abs(axFrame.minY - window.frame.minY) < 5 &&
+                   abs(axFrame.width - window.frame.width) < 5 &&
+                   abs(axFrame.height - window.frame.height) < 5 {
+                    AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
+                    return
                 }
             }
         }
