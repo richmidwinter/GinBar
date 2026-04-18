@@ -146,6 +146,7 @@ class WindowManager: ObservableObject {
         let currentPID = ProcessInfo.processInfo.processIdentifier
         
         var newWindows: [WindowInfo] = []
+        var titledWindowIDs = Set<CGWindowID>()
         
         for windowDict in windowList {
             guard let windowNumber = windowDict[kCGWindowNumber as String] as? CGWindowID,
@@ -187,7 +188,23 @@ class WindowManager: ObservableObject {
                 alpha: alpha
             )
             
+            // Filter out internal/transient windows (typeahead popups, hover bubbles, 1×1 helpers)
+            guard info.frame.width >= 20, info.frame.height >= 20, info.layer < 100 else {
+                continue
+            }
+            
+            if cgTitle?.isEmpty == false {
+                titledWindowIDs.insert(windowNumber)
+            }
+            
             newWindows.append(info)
+        }
+        
+        // Filter out untitled windows for apps that also have titled windows
+        // (untitled windows in a multi-window app are almost always internal/transient)
+        let pidsWithTitledWindows = Set(newWindows.compactMap { titledWindowIDs.contains($0.id) ? $0.pid : nil })
+        newWindows = newWindows.filter {
+            titledWindowIDs.contains($0.id) || !pidsWithTitledWindows.contains($0.pid)
         }
         
         self.windows = newWindows.sorted { $0.layer < $1.layer }
