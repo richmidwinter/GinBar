@@ -40,6 +40,45 @@ final class BarWindow: NSPanel {
     override var canBecomeMain: Bool { allowBecomeKey }
 }
 
+private final class BarContentView: NSView {
+    // Intentionally empty: BarContentView is just a plain NSView wrapper
+    // for the NSHostingView so we can own the full view hierarchy.
+}
+
+private final class BarHostingView<Content: View>: NSHostingView<Content> {
+    private var cursorTrackingArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let area = cursorTrackingArea {
+            removeTrackingArea(area)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        cursorTrackingArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        // Explicitly invalidate cursor rects so AppKit re-evaluates them
+        // for this (non-key) window on every mouse move.
+        window?.invalidateCursorRects(for: self)
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        // Cover the entire hosting view with an arrow cursor rect.
+        // This gives AppKit a proper cursor rect to use when it evaluates
+        // the bar window, which should win over the window below.
+        addCursorRect(bounds, cursor: .arrow)
+    }
+}
+
 class OverlayManager {
 
     private var barWindows: [UInt64: NSWindow] = [:]
@@ -269,8 +308,13 @@ class OverlayManager {
         guard let state = state else { return }
         let view = BarView(barHeight: barHeight, spaceID: spaceID)
             .environmentObject(state)
-        let hosting = NSHostingView(rootView: view)
+        let hosting = BarHostingView(rootView: view)
         hosting.frame = NSRect(x: 0, y: 0, width: frame.width, height: frame.height)
+        hosting.autoresizingMask = [.width, .height]
+        
+        let contentView = BarContentView()
+        contentView.frame = NSRect(x: 0, y: 0, width: frame.width, height: frame.height)
+        contentView.addSubview(hosting)
 
         let window = BarWindow(
             contentRect: frame,
@@ -290,7 +334,7 @@ class OverlayManager {
         window.ignoresMouseEvents = false
         window.becomesKeyOnlyIfNeeded = true
         window.collectionBehavior = [.managed, .ignoresCycle, .fullScreenAuxiliary]
-        window.contentView = hosting
+        window.contentView = contentView
 
         barWindows[spaceID] = window
         

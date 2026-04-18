@@ -632,10 +632,15 @@ class WindowManager: ObservableObject {
                   pos.y < boundsTL.maxY,
                   windowBottom > barTopY else { continue }
             
-            let overlap = windowBottom - barTopY
-            guard overlap > 1 else { continue }
+            // Shrink the window by the overlap plus an 8 px buffer.  The
+            // window server draws resize cursors in a ~3-5 px border outside
+            // the window frame, so we need extra clearance to keep that border
+            // from spilling into the bar area.
+            let buffer: CGFloat = 8
+            let shrink = windowBottom - barTopY + buffer
+            guard shrink > 1 else { continue }
             
-            let newHeight = max(100, size.height - overlap)
+            let newHeight = max(100, size.height - shrink)
             guard abs(newHeight - size.height) > 0.5 else { continue }
             
             var newSize = size
