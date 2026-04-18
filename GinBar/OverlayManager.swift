@@ -119,7 +119,7 @@ class OverlayManager {
             if self.barWindows.isEmpty {
                 self.updateScreens()
             }
-            WindowManager.shared.startAdjustingWindowsForBar(barHeight: NSStatusBar.system.thickness + 4)
+            WindowManager.shared.startAdjustingWindowsForBar(barHeight: NSStatusBar.system.thickness + 10)
         }
     }
     
@@ -257,7 +257,7 @@ class OverlayManager {
     }
 
     private func createBarWindow(for spaceID: UInt64, screen: NSScreen) {
-        let barHeight = NSStatusBar.system.thickness + 4
+        let barHeight = NSStatusBar.system.thickness + 10
         
         let frame = NSRect(
             x: screen.frame.origin.x,
@@ -332,7 +332,7 @@ class OverlayManager {
     }
     
     private func createPopupWindow(for screen: NSScreen) {
-        let barHeight = NSStatusBar.system.thickness + 4
+        let barHeight = NSStatusBar.system.thickness + 10
         let popupHeight: CGFloat = 140
         
         let frame = NSRect(
@@ -386,7 +386,7 @@ class OverlayManager {
               let barWindow = barWindows[spaceID] else { return }
         let chipMinX = barWindow.frame.minX + localMinX
         
-        let barHeight = NSStatusBar.system.thickness + 4
+        let barHeight = NSStatusBar.system.thickness + 10
         let popupHeight: CGFloat = 140
         
         for (screen, window) in popupWindows {
