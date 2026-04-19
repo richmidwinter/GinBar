@@ -361,7 +361,7 @@ class OverlayManager {
         window.acceptsMouseMovedEvents = true
         window.ignoresMouseEvents = false
         window.becomesKeyOnlyIfNeeded = true
-        window.collectionBehavior = [.managed, .ignoresCycle, .fullScreenAuxiliary]
+        window.collectionBehavior = [.stationary, .ignoresCycle, .fullScreenAuxiliary]
         window.contentView = contentView
 
         barWindows[spaceID] = window
