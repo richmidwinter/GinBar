@@ -7,6 +7,7 @@ typealias SLSCopyManagedDisplaySpacesFunc = @convention(c) (Int32) -> Unmanaged<
 typealias SLSAddWindowsToSpacesFunc = @convention(c) (Int32, CFArray, CFArray) -> Int32
 typealias SLSRemoveWindowsFromSpacesFunc = @convention(c) (Int32, CFArray, CFArray) -> Int32
 typealias SLSManagedDisplaySetCurrentSpaceFunc = @convention(c) (Int32, CFString, UInt64) -> Int32
+typealias SLSSpaceSwitchToSpaceFunc = @convention(c) (Int32, UInt64, Int32) -> Int32
 typealias SLSCopySpacesForWindowsFunc = @convention(c) (Int32, UInt64, CFArray) -> Unmanaged<CFArray>?
 
 struct SkyLightAPIs {
@@ -17,6 +18,7 @@ struct SkyLightAPIs {
     let addWindowsToSpaces: SLSAddWindowsToSpacesFunc?
     let removeWindowsFromSpaces: SLSRemoveWindowsFromSpacesFunc?
     let managedDisplaySetCurrentSpace: SLSManagedDisplaySetCurrentSpaceFunc?
+    let spaceSwitchToSpace: SLSSpaceSwitchToSpaceFunc?
     let copySpacesForWindows: SLSCopySpacesForWindowsFunc?
     
     init() {
@@ -26,6 +28,7 @@ struct SkyLightAPIs {
             self.addWindowsToSpaces = nil
             self.removeWindowsFromSpaces = nil
             self.managedDisplaySetCurrentSpace = nil
+            self.spaceSwitchToSpace = nil
             self.copySpacesForWindows = nil
             return
         }
@@ -34,6 +37,7 @@ struct SkyLightAPIs {
         self.addWindowsToSpaces = unsafeBitCast(dlsym(handle, "SLSAddWindowsToSpaces"), to: SLSAddWindowsToSpacesFunc.self)
         self.removeWindowsFromSpaces = unsafeBitCast(dlsym(handle, "SLSRemoveWindowsFromSpaces"), to: SLSRemoveWindowsFromSpacesFunc.self)
         self.managedDisplaySetCurrentSpace = unsafeBitCast(dlsym(handle, "SLSManagedDisplaySetCurrentSpace"), to: SLSManagedDisplaySetCurrentSpaceFunc.self)
+        self.spaceSwitchToSpace = unsafeBitCast(dlsym(handle, "SLSSpaceSwitchToSpace"), to: SLSSpaceSwitchToSpaceFunc.self)
         // Try modern SLS name first, then older CGS name
         if let fn = dlsym(handle, "SLSCopySpacesForWindows") {
             self.copySpacesForWindows = unsafeBitCast(fn, to: SLSCopySpacesForWindowsFunc.self)
@@ -487,11 +491,20 @@ class OverlayManager {
         
         guard let window = barWindows[spaceID] as? BarWindow else { return }
         
-        // Temporarily allow the bar to become key, matching boringBar's allowBecomeKey trick.
+        // Temporarily flip to .managed so makeKeyAndOrderFront triggers the
+        // space switch.  Then restore .stationary so the bar stays hidden
+        // from Mission Control.
+        window.collectionBehavior = [.managed, .ignoresCycle, .fullScreenAuxiliary]
+        
         window.allowBecomeKey = true
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         window.allowBecomeKey = false
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak window] in
+            guard let window = window else { return }
+            window.collectionBehavior = [.stationary, .ignoresCycle, .fullScreenAuxiliary]
+        }
     }
     
     func cleanup() {
