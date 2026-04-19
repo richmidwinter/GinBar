@@ -679,6 +679,23 @@ class WindowManager: ObservableObject {
             return
         }
         
+        // Only resize windows that belong to the current Mission Control space.
+        // windowSpaceCache is populated by updateWindows() from CGWindowList,
+        // so it only contains windows that were visible on the current space.
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(window, &pid) == .success else { return }
+        
+        var titleRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleRef)
+        let title = (titleRef as? String) ?? ""
+        
+        let cacheKey = "\(pid):\(title)"
+        if let cachedSpace = windowSpaceCache[cacheKey],
+           let currentSpace = currentSpaceID,
+           cachedSpace != currentSpace {
+            return
+        }
+        
         var posValue: CFTypeRef?
         var sizeValue: CFTypeRef?
         let posResult = AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &posValue)
@@ -703,21 +720,28 @@ class WindowManager: ObservableObject {
                   pos.y < boundsTL.maxY,
                   windowBottom > barTopY else { continue }
             
-            // Shrink the window by the overlap plus an 8 px buffer.  The
-            // window server draws resize cursors in a ~3-5 px border outside
-            // the window frame, so we need extra clearance to keep that border
-            // from spilling into the bar area.
-            let buffer: CGFloat = 8
-            let shrink = windowBottom - barTopY + buffer
-            guard shrink > 1 else { continue }
+            // The window server draws resize cursors in a ~3-5 px border
+            // outside the window frame, so we need a small safety margin.
+            let buffer: CGFloat = 1
+            let desiredBottom = barTopY - buffer
+            let overlap = windowBottom - desiredBottom
+            guard overlap > 1 else { continue }
             
-            let newHeight = max(100, size.height - shrink)
-            guard abs(newHeight - size.height) > 0.5 else { continue }
-            
-            var newSize = size
-            newSize.height = newHeight
-            if let v = AXValueCreate(.cgSize, &newSize) {
-                AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, v)
+            // Tall enough to shrink from the bottom?
+            let newHeight = size.height - overlap
+            if newHeight >= 50 {
+                var newSize = size
+                newSize.height = newHeight
+                if let v = AXValueCreate(.cgSize, &newSize) {
+                    AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, v)
+                }
+            } else {
+                // Too short to shrink — slide the window up instead.
+                var newPos = pos
+                newPos.y -= overlap
+                if let v = AXValueCreate(.cgPoint, &newPos) {
+                    AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, v)
+                }
             }
             break
         }
