@@ -8,6 +8,7 @@ typealias SLSAddWindowsToSpacesFunc = @convention(c) (Int32, CFArray, CFArray) -
 typealias SLSRemoveWindowsFromSpacesFunc = @convention(c) (Int32, CFArray, CFArray) -> Int32
 typealias SLSManagedDisplaySetCurrentSpaceFunc = @convention(c) (Int32, CFString, UInt64) -> Int32
 typealias SLSSpaceSwitchToSpaceFunc = @convention(c) (Int32, UInt64, Int32) -> Int32
+typealias SLSShowSpacesFunc = @convention(c) (Int32, CFArray) -> Int32
 typealias SLSCopySpacesForWindowsFunc = @convention(c) (Int32, UInt64, CFArray) -> Unmanaged<CFArray>?
 
 struct SkyLightAPIs {
@@ -19,6 +20,7 @@ struct SkyLightAPIs {
     let removeWindowsFromSpaces: SLSRemoveWindowsFromSpacesFunc?
     let managedDisplaySetCurrentSpace: SLSManagedDisplaySetCurrentSpaceFunc?
     let spaceSwitchToSpace: SLSSpaceSwitchToSpaceFunc?
+    let showSpaces: SLSShowSpacesFunc?
     let copySpacesForWindows: SLSCopySpacesForWindowsFunc?
     
     init() {
@@ -29,6 +31,7 @@ struct SkyLightAPIs {
             self.removeWindowsFromSpaces = nil
             self.managedDisplaySetCurrentSpace = nil
             self.spaceSwitchToSpace = nil
+            self.showSpaces = nil
             self.copySpacesForWindows = nil
             return
         }
@@ -38,6 +41,7 @@ struct SkyLightAPIs {
         self.removeWindowsFromSpaces = unsafeBitCast(dlsym(handle, "SLSRemoveWindowsFromSpaces"), to: SLSRemoveWindowsFromSpacesFunc.self)
         self.managedDisplaySetCurrentSpace = unsafeBitCast(dlsym(handle, "SLSManagedDisplaySetCurrentSpace"), to: SLSManagedDisplaySetCurrentSpaceFunc.self)
         self.spaceSwitchToSpace = unsafeBitCast(dlsym(handle, "SLSSpaceSwitchToSpace"), to: SLSSpaceSwitchToSpaceFunc.self)
+        self.showSpaces = unsafeBitCast(dlsym(handle, "SLSShowSpaces"), to: SLSShowSpacesFunc.self)
         // Try modern SLS name first, then older CGS name
         if let fn = dlsym(handle, "SLSCopySpacesForWindows") {
             self.copySpacesForWindows = unsafeBitCast(fn, to: SLSCopySpacesForWindowsFunc.self)
@@ -220,10 +224,7 @@ class OverlayManager {
                     DockManager.shared.updateAppsWithWindows()
                     
                     if let window = self.barWindows[currentSpace] as? BarWindow {
-                        window.allowBecomeKey = true
-                        NSApp.activate(ignoringOtherApps: true)
-                        window.makeKeyAndOrderFront(nil)
-                        window.allowBecomeKey = false
+                        window.orderFront(nil)
                     }
                 }
             }
@@ -483,27 +484,46 @@ class OverlayManager {
     }
     
     func switchToSpace(_ spaceID: UInt64) {
-        if barWindows[spaceID] == nil {
-            if let screen = spaceScreenMap[spaceID] ?? NSScreen.screens.first {
-                createBarWindow(for: spaceID, screen: screen)
+        // Primary: use SLSShowSpaces — it switches to the space without
+        // touching window focus at all.
+        var spaceSwitched = false
+        if let showFn = sls.showSpaces,
+           let cid = sls.mainConnectionID?() {
+            var spaceIDValue = Int64(spaceID)
+            if let spaceNum = CFNumberCreate(nil, .sInt64Type, &spaceIDValue) {
+                let spacesArray = [spaceNum] as CFArray
+                let result = showFn(cid, spacesArray)
+                spaceSwitched = (result == 0)
             }
         }
         
-        guard let window = barWindows[spaceID] as? BarWindow else { return }
+        // Fallback: activate an app on the target space.  macOS switches
+        // to the space containing the activated app.
+        if !spaceSwitched,
+           let app = DockManager.shared.spaceApps[spaceID]?.first {
+            app.activate()
+            spaceSwitched = true
+        }
         
-        // Temporarily flip to .managed so makeKeyAndOrderFront triggers the
-        // space switch.  Then restore .stationary so the bar stays hidden
-        // from Mission Control.
-        window.collectionBehavior = [.managed, .ignoresCycle, .fullScreenAuxiliary]
-        
-        window.allowBecomeKey = true
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
-        window.allowBecomeKey = false
-        
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak window] in
-            guard let window = window else { return }
-            window.collectionBehavior = [.stationary, .ignoresCycle, .fullScreenAuxiliary]
+        // Last resort: .managed flip + makeKeyAndOrderFront.  This steals
+        // focus briefly but always triggers the space switch.
+        if !spaceSwitched {
+            if barWindows[spaceID] == nil {
+                if let screen = spaceScreenMap[spaceID] ?? NSScreen.screens.first {
+                    createBarWindow(for: spaceID, screen: screen)
+                }
+            }
+            if let window = barWindows[spaceID] as? BarWindow {
+                window.collectionBehavior = [.managed, .ignoresCycle, .fullScreenAuxiliary]
+                window.allowBecomeKey = true
+                NSApp.activate(ignoringOtherApps: true)
+                window.makeKeyAndOrderFront(nil)
+                window.allowBecomeKey = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak window] in
+                    guard let window = window else { return }
+                    window.collectionBehavior = [.stationary, .ignoresCycle, .fullScreenAuxiliary]
+                }
+            }
         }
     }
     
