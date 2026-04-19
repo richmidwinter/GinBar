@@ -122,13 +122,6 @@ class OverlayManager {
 
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(updateScreens),
-            name: NSApplication.didChangeScreenParametersNotification,
-            object: nil
-        )
-        
-        NotificationCenter.default.addObserver(
-            self,
             selector: #selector(appWillTerminate),
             name: NSApplication.willTerminateNotification,
             object: nil
@@ -141,13 +134,10 @@ class OverlayManager {
             object: nil
         )
         
-        // Keep the notification observer as a fallback, but also poll SkyLight
-        // directly because activeSpaceDidChangeNotification is unreliable for
-        // background/non-activating apps.
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(spaceDidChange),
-            name: NSWorkspace.activeSpaceDidChangeNotification,
+            selector: #selector(updateScreens),
+            name: NSApplication.didChangeScreenParametersNotification,
             object: nil
         )
         
@@ -167,10 +157,9 @@ class OverlayManager {
             WindowManager.shared.startAdjustingWindowsForBar(barHeight: NSStatusBar.system.thickness + 10)
         }
         
-        // Poll SkyLight every 0.2 s for space changes.
-        // activeSpaceDidChangeNotification is unreliable for background apps,
-        // so we detect changes by comparing against the last known space ID.
-        spaceCheckTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+        // activeSpaceDidChangeNotification is not delivered to background
+        // panel apps, so we poll SkyLight directly to detect space changes.
+        spaceCheckTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             self?.pollForSpaceChange()
         }
     }
@@ -214,7 +203,7 @@ class OverlayManager {
         // cache gets polluted with the transient union of origin+destination.
         DockManager.shared.isInTransition = true
         
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
             guard let self = self else { return }
             
             DockManager.shared.isInTransition = false
