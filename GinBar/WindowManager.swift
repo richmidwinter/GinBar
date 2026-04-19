@@ -126,8 +126,13 @@ class WindowManager: ObservableObject {
     }
     
     @objc private func spaceDidChange() {
+        // log removed
         selectedApp = nil // hide popup when switching spaces
-        updateWindows()
+        // Defer so OverlayManager has a chance to update currentSpaceID
+        // before we cache visible windows against the wrong space.
+        DispatchQueue.main.async { [weak self] in
+            self?.updateWindows()
+        }
     }
     
     func switchToSpace(_ spaceID: UInt64) {

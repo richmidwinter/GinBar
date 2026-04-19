@@ -4,10 +4,17 @@ import Combine
 @MainActor
 class DockManager: ObservableObject {
     static let shared = DockManager()
-    @Published var appsWithWindows: [NSRunningApplication] = []
+    /// Per-space app lists. Each bar reads its own entry so it never shows
+    /// windows from a different space, even during Mission Control transitions.
+    @Published var spaceApps: [UInt64: [NSRunningApplication]] = [:]
+    
+    /// Set by OverlayManager while a Mission Control transition is in progress.
+    /// Timer ticks are suppressed so no space's cache gets polluted with bloat.
+    var isInTransition = false
     
     private var cancellables = Set<AnyCancellable>()
     private var timer: Timer?
+    private var pendingPIDs: Set<pid_t>?
     
     private var isRunningInPreview: Bool {
         let env = ProcessInfo.processInfo.environment
@@ -28,7 +35,7 @@ class DockManager: ObservableObject {
     }
     
     private init() {
-        guard !isRunningInPreview else { return }
+        guard !isRunningInPreview && !isInTransition else { return }
         
         updateAppsWithWindows()
         
@@ -45,8 +52,12 @@ class DockManager: ObservableObject {
         }
     }
     
-    @objc private func updateAppsWithWindows() {
+    func updateAppsWithWindows() {
         guard !isRunningInPreview else { return }
+        if isInTransition {
+            // log removed
+            return
+        }
         
         let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         guard let windowList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
@@ -108,20 +119,32 @@ class DockManager: ObservableObject {
             currentPIDs.contains(app.processIdentifier)
         }.sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
         
-        let currentAppPIDs = Set(appsWithWindows.map { $0.processIdentifier })
+        guard let currentSpace = WindowManager.shared.currentSpaceID else {
+            // log removed
+            return
+        }
+        let cachedApps = spaceApps[currentSpace] ?? []
+        let cachedPIDs = Set(cachedApps.map { $0.processIdentifier })
         let candidatePIDs = Set(candidateApps.map { $0.processIdentifier })
         
-        // CRITICAL: Reject "bloated" lists during space transitions
-        // Space transitions add MULTIPLE apps at once, while opening a single app adds just 1
-        let addedCount = candidateApps.count - appsWithWindows.count
-        if !appsWithWindows.isEmpty && addedCount > 1 {
-            // Multiple apps appeared at once - space transition bloat, ignore
+        // log removed
+        
+        guard candidatePIDs != cachedPIDs else {
+            pendingPIDs = nil
             return
         }
         
-        // List is same size or smaller - safe to update
-        if candidatePIDs != currentAppPIDs {
-            appsWithWindows = candidateApps
+        // Bypass stability check when the cache is empty (first visit to a
+        // space) so the bar populates immediately instead of waiting for a
+        // second timer tick.
+        if candidatePIDs == pendingPIDs || spaceApps[currentSpace] == nil {
+            spaceApps[currentSpace] = candidateApps
+            pendingPIDs = nil
+            // log removed
+        } else {
+            // First time seeing this set — wait one more tick.
+            pendingPIDs = candidatePIDs
+            // log removed
         }
     }
     

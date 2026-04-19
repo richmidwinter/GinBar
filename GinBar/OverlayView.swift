@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 
 struct BarView: View {
     @EnvironmentObject var state: AppState
@@ -7,7 +8,13 @@ struct BarView: View {
     let barHeight: CGFloat
     let spaceID: UInt64
     
+    /// Lightweight pulse to force re-evaluation when the bar becomes visible.
+    /// SwiftUI in hidden NSPanels can miss @Published updates, so this
+    /// ensures the bar always renders the latest spaceApps cache.
+    @State private var refreshTick = 0
+    
     var body: some View {
+        let _ = refreshTick
         HStack(spacing: 4) {
             ApplicationsMenu()
                 .frame(width: 28)
@@ -16,7 +23,8 @@ struct BarView: View {
                 .background(Color.white.opacity(0.3))
                 .padding(.horizontal, 4)
             
-            ForEach(dockManager.appsWithWindows, id: \.processIdentifier) { app in
+            let apps = dockManager.spaceApps[spaceID] ?? []
+            ForEach(apps, id: \.processIdentifier) { app in
                 AppItemView(
                     app: app,
                     isActive: app.isActive,
@@ -38,6 +46,9 @@ struct BarView: View {
             Color.black.opacity(0.4)
                 .overlay(.ultraThinMaterial)
         )
+        .onReceive(Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()) { _ in
+            refreshTick += 1
+        }
     }
 }
 

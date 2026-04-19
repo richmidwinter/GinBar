@@ -108,6 +108,9 @@ class OverlayManager {
         return false
     }
 
+    private var spaceCheckTimer: Timer?
+    private var lastKnownSpaceID: UInt64?
+    
     init(state: AppState) {
         self.state = state
         
@@ -138,6 +141,9 @@ class OverlayManager {
             object: nil
         )
         
+        // Keep the notification observer as a fallback, but also poll SkyLight
+        // directly because activeSpaceDidChangeNotification is unreliable for
+        // background/non-activating apps.
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(spaceDidChange),
@@ -160,6 +166,13 @@ class OverlayManager {
             }
             WindowManager.shared.startAdjustingWindowsForBar(barHeight: NSStatusBar.system.thickness + 10)
         }
+        
+        // Poll SkyLight every 0.2 s for space changes.
+        // activeSpaceDidChangeNotification is unreliable for background apps,
+        // so we detect changes by comparing against the last known space ID.
+        spaceCheckTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            self?.pollForSpaceChange()
+        }
     }
     
     @objc private func appWillTerminate() {
@@ -176,23 +189,54 @@ class OverlayManager {
         }
     }
     
+    private func pollForSpaceChange() {
+        guard let copyFn = sls.copyManagedDisplaySpaces,
+              let displays = copyFn(sls.mainConnectionID?() ?? 0)?.takeRetainedValue() as? [NSDictionary] else { return }
+        for display in displays {
+            guard let currentSpace = (display["Current Space"] as? NSDictionary)?["id64"] as? UInt64 else { continue }
+            if currentSpace != lastKnownSpaceID {
+                // Clear the old space's cache so it can't show stale bloat
+                // when we return to it later.
+                if let oldSpace = lastKnownSpaceID {
+                    DockManager.shared.spaceApps[oldSpace] = nil
+                }
+                lastKnownSpaceID = currentSpace
+                spaceDidChange()
+            }
+        }
+    }
+    
     @objc private func spaceDidChange() {
+        // log removed
         refreshSpaceBars()
         
-        // Show the bar for the current space after the transition completes.
-        DispatchQueue.main.async { [weak self] in
+        // Suppress DockManager timer ticks during the transition so no space's
+        // cache gets polluted with the transient union of origin+destination.
+        DockManager.shared.isInTransition = true
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             guard let self = self else { return }
-            guard let copyFn = self.sls.copyManagedDisplaySpaces,
-                  let displays = copyFn(self.sls.mainConnectionID?() ?? 0)?.takeRetainedValue() as? [NSDictionary] else { return }
             
-            for display in displays {
-                guard let currentSpace = (display["Current Space"] as? NSDictionary)?["id64"] as? UInt64 else { continue }
-                WindowManager.shared.currentSpaceID = currentSpace
-                if let window = self.barWindows[currentSpace] as? BarWindow {
-                    window.allowBecomeKey = true
-                    NSApp.activate(ignoringOtherApps: true)
-                    window.makeKeyAndOrderFront(nil)
-                    window.allowBecomeKey = false
+            DockManager.shared.isInTransition = false
+            
+            if let copyFn = self.sls.copyManagedDisplaySpaces,
+               let displays = copyFn(self.sls.mainConnectionID?() ?? 0)?.takeRetainedValue() as? [NSDictionary] {
+                for display in displays {
+                    guard let currentSpace = (display["Current Space"] as? NSDictionary)?["id64"] as? UInt64 else { continue }
+                    // log removed
+                    WindowManager.shared.currentSpaceID = currentSpace
+                    
+                    // Populate the cache BEFORE making the bar visible so the
+                    // first frame already shows the correct app list.
+                    DockManager.shared.updateAppsWithWindows()
+                    
+                    if let window = self.barWindows[currentSpace] as? BarWindow {
+                        window.allowBecomeKey = true
+                        NSApp.activate(ignoringOtherApps: true)
+                        window.makeKeyAndOrderFront(nil)
+                        window.allowBecomeKey = false
+                        // log removed
+                    }
                 }
             }
         }
