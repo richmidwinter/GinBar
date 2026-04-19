@@ -44,6 +44,7 @@ class WindowManager: ObservableObject {
     private var nextSyntheticID: CGWindowID = 0xFFFF0000
     private var syntheticWindows: [String: WindowInfo] = [:]
     private var windowSpaceCache: [String: UInt64] = [:]
+    private let sls = SkyLightAPIs.shared
     
     var isRunningInPreview: Bool {
         let env = ProcessInfo.processInfo.environment
@@ -139,6 +140,31 @@ class WindowManager: ObservableObject {
         onSwitchToSpace?(spaceID)
     }
     
+    /// Ask SkyLight which Mission Control spaces a window belongs to.
+    /// Tries multiple return formats since the private API structure varies by macOS version.
+    private func spacesForWindow(windowNumber: Int) -> [UInt64] {
+        guard let copyFn = sls.copySpacesForWindows,
+              let cid = sls.mainConnectionID?() else { return [] }
+        
+        let arr = NSMutableArray()
+        arr.add(windowNumber)
+        guard let raw = copyFn(cid, 7, arr as CFArray)?.takeRetainedValue() else { return [] }
+        
+        if let dicts = raw as? [NSDictionary] {
+            return dicts.compactMap { $0["id64"] as? UInt64 }
+        }
+        if let numbers = raw as? [NSNumber] {
+            return numbers.map { $0.uint64Value }
+        }
+        if let outer = raw as? [NSArray], let inner = outer.first as? [NSDictionary] {
+            return inner.compactMap { $0["id64"] as? UInt64 }
+        }
+        if let outer = raw as? [NSArray], let inner = outer.first as? [NSNumber] {
+            return inner.map { $0.uint64Value }
+        }
+        return []
+    }
+    
     func updateWindows() {
         guard !isRunningInPreview else { return }
         
@@ -210,6 +236,46 @@ class WindowManager: ObservableObject {
         let pidsWithTitledWindows = Set(newWindows.compactMap { titledWindowIDs.contains($0.id) ? $0.pid : nil })
         newWindows = newWindows.filter {
             titledWindowIDs.contains($0.id) || !pidsWithTitledWindows.contains($0.pid)
+        }
+        
+        // Filter to current space so swipe previews don't inflate window counts.
+        // Same approach as DockManager: SkyLight first, then kCGWindowWorkspace,
+        // then fall back to the baseline (all visible windows).
+        if let space = currentSpaceID {
+            let skyLightAvailable = sls.copySpacesForWindows != nil
+            var filtered = [WindowInfo]()
+            var skyLightFoundAny = false
+            
+            if skyLightAvailable {
+                for window in newWindows {
+                    let spaces = spacesForWindow(windowNumber: Int(window.id))
+                    if spaces.contains(space) {
+                        filtered.append(window)
+                    }
+                }
+                if !filtered.isEmpty {
+                    newWindows = filtered
+                    skyLightFoundAny = true
+                }
+            }
+            
+            if !skyLightFoundAny {
+                var workspaceCounts: [Int: Int] = [:]
+                var windowToWorkspace: [CGWindowID: Int] = [:]
+                for windowDict in windowList {
+                    if let num = windowDict[kCGWindowNumber as String] as? Int,
+                       let ws = windowDict["kCGWindowWorkspace" as String] as? Int {
+                        workspaceCounts[ws, default: 0] += 1
+                        windowToWorkspace[CGWindowID(num)] = ws
+                    }
+                }
+                if let dominantWS = workspaceCounts.max(by: { $0.value < $1.value })?.key {
+                    let wsWindows = newWindows.filter { windowToWorkspace[$0.id] == dominantWS }
+                    if !wsWindows.isEmpty {
+                        newWindows = wsWindows
+                    }
+                }
+            }
         }
         
         self.windows = newWindows.sorted { $0.layer < $1.layer }
