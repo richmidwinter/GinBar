@@ -1,26 +1,6 @@
 import SwiftUI
 import Darwin
 
-private typealias SLSMainConnectionIDFunc = @convention(c) () -> Int32
-private typealias SLSCopyManagedDisplaySpacesFunc = @convention(c) (Int32) -> Unmanaged<CFArray>?
-
-private struct SkyLightAPIs {
-    static let shared = SkyLightAPIs()
-    
-    let mainConnectionID: SLSMainConnectionIDFunc?
-    let copyManagedDisplaySpaces: SLSCopyManagedDisplaySpacesFunc?
-    
-    init() {
-        guard let handle = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW) else {
-            self.mainConnectionID = nil
-            self.copyManagedDisplaySpaces = nil
-            return
-        }
-        self.mainConnectionID = unsafeBitCast(dlsym(handle, "SLSMainConnectionID"), to: SLSMainConnectionIDFunc.self)
-        self.copyManagedDisplaySpaces = unsafeBitCast(dlsym(handle, "SLSCopyManagedDisplaySpaces"), to: SLSCopyManagedDisplaySpacesFunc.self)
-    }
-}
-
 struct SpacesMenu: View {
     @State private var spaces: [(id: UInt64, index: Int)] = []
     @State private var currentSpaceIndex: Int = 1

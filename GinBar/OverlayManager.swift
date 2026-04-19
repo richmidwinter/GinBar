@@ -2,13 +2,14 @@ import Cocoa
 import SwiftUI
 import Combine
 
-private typealias SLSMainConnectionIDFunc = @convention(c) () -> Int32
-private typealias SLSCopyManagedDisplaySpacesFunc = @convention(c) (Int32) -> Unmanaged<CFArray>?
-private typealias SLSAddWindowsToSpacesFunc = @convention(c) (Int32, CFArray, CFArray) -> Int32
-private typealias SLSRemoveWindowsFromSpacesFunc = @convention(c) (Int32, CFArray, CFArray) -> Int32
-private typealias SLSManagedDisplaySetCurrentSpaceFunc = @convention(c) (Int32, CFString, UInt64) -> Int32
+typealias SLSMainConnectionIDFunc = @convention(c) () -> Int32
+typealias SLSCopyManagedDisplaySpacesFunc = @convention(c) (Int32) -> Unmanaged<CFArray>?
+typealias SLSAddWindowsToSpacesFunc = @convention(c) (Int32, CFArray, CFArray) -> Int32
+typealias SLSRemoveWindowsFromSpacesFunc = @convention(c) (Int32, CFArray, CFArray) -> Int32
+typealias SLSManagedDisplaySetCurrentSpaceFunc = @convention(c) (Int32, CFString, UInt64) -> Int32
+typealias SLSCopySpacesForWindowsFunc = @convention(c) (Int32, UInt64, CFArray) -> Unmanaged<CFArray>?
 
-private struct SkyLightAPIs {
+struct SkyLightAPIs {
     static let shared = SkyLightAPIs()
     
     let mainConnectionID: SLSMainConnectionIDFunc?
@@ -16,6 +17,7 @@ private struct SkyLightAPIs {
     let addWindowsToSpaces: SLSAddWindowsToSpacesFunc?
     let removeWindowsFromSpaces: SLSRemoveWindowsFromSpacesFunc?
     let managedDisplaySetCurrentSpace: SLSManagedDisplaySetCurrentSpaceFunc?
+    let copySpacesForWindows: SLSCopySpacesForWindowsFunc?
     
     init() {
         guard let handle = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW) else {
@@ -24,6 +26,7 @@ private struct SkyLightAPIs {
             self.addWindowsToSpaces = nil
             self.removeWindowsFromSpaces = nil
             self.managedDisplaySetCurrentSpace = nil
+            self.copySpacesForWindows = nil
             return
         }
         self.mainConnectionID = unsafeBitCast(dlsym(handle, "SLSMainConnectionID"), to: SLSMainConnectionIDFunc.self)
@@ -31,6 +34,14 @@ private struct SkyLightAPIs {
         self.addWindowsToSpaces = unsafeBitCast(dlsym(handle, "SLSAddWindowsToSpaces"), to: SLSAddWindowsToSpacesFunc.self)
         self.removeWindowsFromSpaces = unsafeBitCast(dlsym(handle, "SLSRemoveWindowsFromSpaces"), to: SLSRemoveWindowsFromSpacesFunc.self)
         self.managedDisplaySetCurrentSpace = unsafeBitCast(dlsym(handle, "SLSManagedDisplaySetCurrentSpace"), to: SLSManagedDisplaySetCurrentSpaceFunc.self)
+        // Try modern SLS name first, then older CGS name
+        if let fn = dlsym(handle, "SLSCopySpacesForWindows") {
+            self.copySpacesForWindows = unsafeBitCast(fn, to: SLSCopySpacesForWindowsFunc.self)
+        } else if let fn = dlsym(handle, "CGSCopySpacesForWindows") {
+            self.copySpacesForWindows = unsafeBitCast(fn, to: SLSCopySpacesForWindowsFunc.self)
+        } else {
+            self.copySpacesForWindows = nil
+        }
     }
 }
 
@@ -184,11 +195,6 @@ class OverlayManager {
         for display in displays {
             guard let currentSpace = (display["Current Space"] as? NSDictionary)?["id64"] as? UInt64 else { continue }
             if currentSpace != lastKnownSpaceID {
-                // Clear the old space's cache so it can't show stale bloat
-                // when we return to it later.
-                if let oldSpace = lastKnownSpaceID {
-                    DockManager.shared.spaceApps[oldSpace] = nil
-                }
                 lastKnownSpaceID = currentSpace
                 spaceDidChange()
             }
@@ -196,27 +202,17 @@ class OverlayManager {
     }
     
     @objc private func spaceDidChange() {
-        // log removed
         refreshSpaceBars()
         
-        // Suppress DockManager timer ticks during the transition so no space's
-        // cache gets polluted with the transient union of origin+destination.
-        DockManager.shared.isInTransition = true
-        
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
             guard let self = self else { return }
-            
-            DockManager.shared.isInTransition = false
             
             if let copyFn = self.sls.copyManagedDisplaySpaces,
                let displays = copyFn(self.sls.mainConnectionID?() ?? 0)?.takeRetainedValue() as? [NSDictionary] {
                 for display in displays {
                     guard let currentSpace = (display["Current Space"] as? NSDictionary)?["id64"] as? UInt64 else { continue }
-                    // log removed
                     WindowManager.shared.currentSpaceID = currentSpace
-                    
-                    // Populate the cache BEFORE making the bar visible so the
-                    // first frame already shows the correct app list.
+                    DockManager.shared.spaceApps[currentSpace] = nil
                     DockManager.shared.updateAppsWithWindows()
                     
                     if let window = self.barWindows[currentSpace] as? BarWindow {
@@ -224,7 +220,6 @@ class OverlayManager {
                         NSApp.activate(ignoringOtherApps: true)
                         window.makeKeyAndOrderFront(nil)
                         window.allowBecomeKey = false
-                        // log removed
                     }
                 }
             }

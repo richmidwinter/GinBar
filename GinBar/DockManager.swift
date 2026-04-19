@@ -4,17 +4,11 @@ import Combine
 @MainActor
 class DockManager: ObservableObject {
     static let shared = DockManager()
-    /// Per-space app lists. Each bar reads its own entry so it never shows
-    /// windows from a different space, even during Mission Control transitions.
     @Published var spaceApps: [UInt64: [NSRunningApplication]] = [:]
-    
-    /// Set by OverlayManager while a Mission Control transition is in progress.
-    /// Timer ticks are suppressed so no space's cache gets polluted with bloat.
-    var isInTransition = false
     
     private var cancellables = Set<AnyCancellable>()
     private var timer: Timer?
-    private var pendingPIDs: Set<pid_t>?
+    private let sls = SkyLightAPIs.shared
     
     private var isRunningInPreview: Bool {
         let env = ProcessInfo.processInfo.environment
@@ -35,7 +29,13 @@ class DockManager: ObservableObject {
     }
     
     private init() {
-        guard !isRunningInPreview && !isInTransition else { return }
+        guard !isRunningInPreview else { return }
+        
+        if sls.copySpacesForWindows == nil {
+            print("[GinBar] SLSCopySpacesForWindows not found, falling back to kCGWindowWorkspace")
+        } else {
+            print("[GinBar] SLSCopySpacesForWindows loaded")
+        }
         
         updateAppsWithWindows()
         
@@ -52,33 +52,106 @@ class DockManager: ObservableObject {
         }
     }
     
+    /// Ask SkyLight which Mission Control spaces a window belongs to.
+    /// Tries multiple return formats since the private API structure varies by macOS version.
+    private func spacesForWindow(windowNumber: Int) -> [UInt64] {
+        guard let copyFn = sls.copySpacesForWindows,
+              let cid = sls.mainConnectionID?() else { return [] }
+        
+        let arr = NSMutableArray()
+        arr.add(windowNumber)
+        guard let raw = copyFn(cid, 7, arr as CFArray)?.takeRetainedValue() else { return [] }
+        
+        // Format 1: flat array of NSDictionary with "id64" key
+        if let dicts = raw as? [NSDictionary] {
+            return dicts.compactMap { $0["id64"] as? UInt64 }
+        }
+        
+        // Format 2: flat array of NSNumber (space IDs directly)
+        if let numbers = raw as? [NSNumber] {
+            return numbers.map { $0.uint64Value }
+        }
+        
+        // Format 3: array of arrays (one per window), each inner array contains NSDictionary
+        if let outer = raw as? [NSArray], let inner = outer.first as? [NSDictionary] {
+            return inner.compactMap { $0["id64"] as? UInt64 }
+        }
+        
+        // Format 4: array of arrays of NSNumber
+        if let outer = raw as? [NSArray], let inner = outer.first as? [NSNumber] {
+            return inner.map { $0.uint64Value }
+        }
+        
+        return []
+    }
+    
     func updateAppsWithWindows() {
         guard !isRunningInPreview else { return }
-        if isInTransition {
-            // log removed
-            return
-        }
         
         let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         guard let windowList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
             return
         }
         
-        // Get current PIDs from visible windows
+        let currentSpace = WindowManager.shared.currentSpaceID
+        
         var currentPIDs = Set<pid_t>()
+        
+        // Collect visible PIDs.  Start with the old reliable baseline (all
+        // visible windows).  Then if we know the current space, try to refine
+        // the list with SkyLight or kCGWindowWorkspace.  If those fail we still
+        // have the baseline so the bar never goes blank.
         for windowDict in windowList {
             if let ownerPID = windowDict[kCGWindowOwnerPID as String] as? pid_t {
                 currentPIDs.insert(ownerPID)
             }
         }
         
-        // Get apps for these PIDs
+        if let space = currentSpace {
+            let skyLightAvailable = sls.copySpacesForWindows != nil
+            var filteredPIDs = Set<pid_t>()
+            var skyLightFoundAny = false
+            
+            if skyLightAvailable {
+                for windowDict in windowList {
+                    guard let windowNumber = windowDict[kCGWindowNumber as String] as? Int,
+                          let ownerPID = windowDict[kCGWindowOwnerPID as String] as? pid_t else { continue }
+                    let spaces = spacesForWindow(windowNumber: windowNumber)
+                    if spaces.contains(space) {
+                        filteredPIDs.insert(ownerPID)
+                    }
+                }
+                if !filteredPIDs.isEmpty {
+                    currentPIDs = filteredPIDs
+                    skyLightFoundAny = true
+                }
+            }
+            
+            if !skyLightFoundAny {
+                var workspaceCounts: [Int: Int] = [:]
+                var pidToWorkspace: [pid_t: Int] = [:]
+                for windowDict in windowList {
+                    if let ownerPID = windowDict[kCGWindowOwnerPID as String] as? pid_t,
+                       let ws = windowDict["kCGWindowWorkspace" as String] as? Int {
+                        workspaceCounts[ws, default: 0] += 1
+                        pidToWorkspace[ownerPID] = ws
+                    }
+                }
+                if let dominantWS = workspaceCounts.max(by: { $0.value < $1.value })?.key {
+                    let wsPIDs = Set(pidToWorkspace.filter { $0.value == dominantWS }.map { $0.key })
+                    if !wsPIDs.isEmpty {
+                        currentPIDs = wsPIDs
+                    }
+                }
+            }
+        }
+        
         let currentBundleId = Bundle.main.bundleIdentifier ?? ""
         let allApps = NSWorkspace.shared.runningApplications.filter { app in
             if let bundleId = app.bundleIdentifier {
                 return bundleId != currentBundleId && app.activationPolicy == .regular
             }
-            return app.processIdentifier != ProcessInfo.processInfo.processIdentifier 
+            return app.processIdentifier != ProcessInfo.processInfo.processIdentifier
                 && app.activationPolicy == .regular
         }
         
@@ -97,14 +170,11 @@ class DockManager: ObservableObject {
                     AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleRef)
                     let title = (titleRef as? String) ?? ""
                     
-                    if let currentSpace = WindowManager.shared.currentSpaceID,
-                       let cachedSpace = WindowManager.shared.spaceIDForMinimizedWindow(pid: app.processIdentifier, title: title) {
-                        if cachedSpace == currentSpace {
-                            hasMinimizedOnCurrentSpace = true
-                            break
-                        }
-                    } else {
-                        // Unknown space, include as fallback
+                    if let cachedSpace = WindowManager.shared.spaceIDForMinimizedWindow(pid: app.processIdentifier, title: title),
+                       cachedSpace == currentSpace {
+                        hasMinimizedOnCurrentSpace = true
+                        break
+                    } else if WindowManager.shared.spaceIDForMinimizedWindow(pid: app.processIdentifier, title: title) == nil {
                         hasMinimizedOnCurrentSpace = true
                         break
                     }
@@ -115,37 +185,16 @@ class DockManager: ObservableObject {
             }
         }
         
-        let candidateApps = allApps.filter { app in
-            currentPIDs.contains(app.processIdentifier)
-        }.sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
+        let candidateApps = allApps.filter { currentPIDs.contains($0.processIdentifier) }
+            .sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
         
-        guard let currentSpace = WindowManager.shared.currentSpaceID else {
-            // log removed
-            return
-        }
-        let cachedApps = spaceApps[currentSpace] ?? []
+        let cacheKey = currentSpace ?? 0
+        let cachedApps = spaceApps[cacheKey] ?? []
         let cachedPIDs = Set(cachedApps.map { $0.processIdentifier })
         let candidatePIDs = Set(candidateApps.map { $0.processIdentifier })
         
-        // log removed
-        
-        guard candidatePIDs != cachedPIDs else {
-            pendingPIDs = nil
-            return
-        }
-        
-        // Bypass stability check when the cache is empty (first visit to a
-        // space) so the bar populates immediately instead of waiting for a
-        // second timer tick.
-        if candidatePIDs == pendingPIDs || spaceApps[currentSpace] == nil {
-            spaceApps[currentSpace] = candidateApps
-            pendingPIDs = nil
-            // log removed
-        } else {
-            // First time seeing this set — wait one more tick.
-            pendingPIDs = candidatePIDs
-            // log removed
-        }
+        guard candidatePIDs != cachedPIDs else { return }
+        spaceApps[cacheKey] = candidateApps
     }
     
     func activateApp(_ app: NSRunningApplication) {
