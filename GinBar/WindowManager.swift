@@ -44,6 +44,7 @@ class WindowManager: ObservableObject {
     private var nextSyntheticID: CGWindowID = 0xFFFF0000
     private var syntheticWindows: [String: WindowInfo] = [:]
     private var windowSpaceCache: [String: UInt64] = [:]
+    private var thumbnailCaptureTime: [CGWindowID: Date] = [:]
     private let sls = SkyLightAPIs.shared
     
     var isRunningInPreview: Bool {
@@ -363,7 +364,8 @@ class WindowManager: ObservableObject {
     func captureThumbnail(for windowID: CGWindowID) -> NSImage? {
         guard !isRunningInPreview else { return nil }
         
-        if let cached = thumbnails[windowID] {
+        let isFresh = thumbnailCaptureTime[windowID].map { Date().timeIntervalSince($0) < 10 } ?? false
+        if let cached = thumbnails[windowID], isFresh {
             return cached
         }
         
@@ -406,6 +408,7 @@ class WindowManager: ObservableObject {
             
             await MainActor.run {
                 self.thumbnails[windowID] = nsImage
+                self.thumbnailCaptureTime[windowID] = Date()
             }
         } catch {
             await MainActor.run {
