@@ -62,7 +62,7 @@ struct GinBarApp: App {
             SettingsView().environmentObject(state)
         }
         
-        MenuBarExtra("GinBar", systemImage: "line.3.horizontal") {
+        MenuBarExtra("GinBar", image: "GinIcon") {
             MenuBarView().environmentObject(state)
         }
     }
