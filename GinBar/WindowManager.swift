@@ -291,20 +291,26 @@ class WindowManager: ObservableObject {
     }
     
     func windows(for app: NSRunningApplication) -> [WindowInfo] {
-        var result = windows.filter { $0.pid == app.processIdentifier }
+        // Visible windows sorted left-to-right by screen position.
+        var visible = windows.filter { $0.pid == app.processIdentifier }
+            .sorted { $0.frame.minX < $1.frame.minX }
         
-        // Also include minimized windows via Accessibility API
+        // Minimized windows from Accessibility API — appended on the far right.
+        var minimized: [WindowInfo] = []
+        
         let appElement = AXUIElementCreateApplication(app.processIdentifier)
         var value: AnyObject?
         guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
               let axWindows = value as? [AXUIElement] else {
-            return result
+            return visible
         }
         
         for axWindow in axWindows {
             var minimizedRef: CFTypeRef?
             AXUIElementCopyAttributeValue(axWindow, kAXMinimizedAttribute as CFString, &minimizedRef)
-            guard let minimized = minimizedRef, CFGetTypeID(minimized) == CFBooleanGetTypeID(), CFBooleanGetValue(minimized as! CFBoolean) else { continue }
+            guard let isMinimized = minimizedRef,
+                  CFGetTypeID(isMinimized) == CFBooleanGetTypeID(),
+                  CFBooleanGetValue(isMinimized as! CFBoolean) else { continue }
             
             var titleRef: CFTypeRef?
             AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleRef)
@@ -320,11 +326,11 @@ class WindowManager: ObservableObject {
             }
             
             // Skip if already in the visible list
-            if result.contains(where: { $0.title == title }) { continue }
+            if visible.contains(where: { $0.title == title }) { continue }
             
             let key = "\(app.processIdentifier):\(title)"
             if let cached = syntheticWindows[key] {
-                result.append(cached)
+                minimized.append(cached)
             } else {
                 let id = nextSyntheticID
                 nextSyntheticID += 1
@@ -339,11 +345,11 @@ class WindowManager: ObservableObject {
                     alpha: 1.0
                 )
                 syntheticWindows[key] = info
-                result.append(info)
+                minimized.append(info)
             }
         }
         
-        return result
+        return visible + minimized
     }
     
     func spaceIDForMinimizedWindow(pid: pid_t, title: String) -> UInt64? {
