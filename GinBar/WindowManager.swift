@@ -32,6 +32,7 @@ class WindowManager: ObservableObject {
     @Published var permissionStatus: CapturePermissionStatus = .unknown
     @Published var isPopupHovered: Bool = false
     @Published var currentSpaceID: UInt64?
+    @Published var hasFullscreenWindow: Bool = false
     
     var onSwitchToSpace: ((UInt64) -> Void)?
     
@@ -280,6 +281,32 @@ class WindowManager: ObservableObject {
         }
         
         self.windows = newWindows.sorted { $0.layer < $1.layer }
+        
+        // Detect fullscreen spaces by asking each app on the current space
+        // whether any of its windows reports kAXFullScreenAttribute.
+        var hasFullscreen = false
+        if let currentSpace = currentSpaceID,
+           let apps = DockManager.shared.spaceApps[currentSpace] {
+            for app in apps {
+                let appEl = AXUIElementCreateApplication(app.processIdentifier)
+                var value: AnyObject?
+                if AXUIElementCopyAttributeValue(appEl, kAXWindowsAttribute as CFString, &value) == .success,
+                   let axWindows = value as? [AXUIElement] {
+                    for axWindow in axWindows {
+                        var fsRef: CFTypeRef?
+                        if AXUIElementCopyAttributeValue(axWindow, "AXFullScreen" as CFString, &fsRef) == .success,
+                           let fs = fsRef,
+                           CFGetTypeID(fs) == CFBooleanGetTypeID(),
+                           CFBooleanGetValue(fs as! CFBoolean) {
+                            hasFullscreen = true
+                            break
+                        }
+                    }
+                }
+                if hasFullscreen { break }
+            }
+        }
+        self.hasFullscreenWindow = hasFullscreen
         
         // Cache visible windows to current space for minimized window tracking
         if let spaceID = currentSpaceID {

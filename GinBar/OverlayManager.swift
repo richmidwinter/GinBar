@@ -1,6 +1,7 @@
 import Cocoa
 import SwiftUI
 import Combine
+import ApplicationServices
 
 typealias SLSMainConnectionIDFunc = @convention(c) () -> Int32
 typealias SLSCopyManagedDisplaySpacesFunc = @convention(c) (Int32) -> Unmanaged<CFArray>?
@@ -9,6 +10,7 @@ typealias SLSRemoveWindowsFromSpacesFunc = @convention(c) (Int32, CFArray, CFArr
 typealias SLSManagedDisplaySetCurrentSpaceFunc = @convention(c) (Int32, CFString, UInt64) -> Int32
 typealias SLSSpaceSwitchToSpaceFunc = @convention(c) (Int32, UInt64, Int32) -> Int32
 typealias SLSShowSpacesFunc = @convention(c) (Int32, CFArray) -> Int32
+typealias SLSCopySpacesFunc = @convention(c) (Int32, UInt64) -> Unmanaged<CFArray>?
 typealias SLSCopySpacesForWindowsFunc = @convention(c) (Int32, UInt64, CFArray) -> Unmanaged<CFArray>?
 
 struct SkyLightAPIs {
@@ -21,6 +23,7 @@ struct SkyLightAPIs {
     let managedDisplaySetCurrentSpace: SLSManagedDisplaySetCurrentSpaceFunc?
     let spaceSwitchToSpace: SLSSpaceSwitchToSpaceFunc?
     let showSpaces: SLSShowSpacesFunc?
+    let copySpaces: SLSCopySpacesFunc?
     let copySpacesForWindows: SLSCopySpacesForWindowsFunc?
     
     init() {
@@ -32,6 +35,7 @@ struct SkyLightAPIs {
             self.managedDisplaySetCurrentSpace = nil
             self.spaceSwitchToSpace = nil
             self.showSpaces = nil
+            self.copySpaces = nil
             self.copySpacesForWindows = nil
             return
         }
@@ -42,6 +46,14 @@ struct SkyLightAPIs {
         self.managedDisplaySetCurrentSpace = unsafeBitCast(dlsym(handle, "SLSManagedDisplaySetCurrentSpace"), to: SLSManagedDisplaySetCurrentSpaceFunc.self)
         self.spaceSwitchToSpace = unsafeBitCast(dlsym(handle, "SLSSpaceSwitchToSpace"), to: SLSSpaceSwitchToSpaceFunc.self)
         self.showSpaces = unsafeBitCast(dlsym(handle, "SLSShowSpaces"), to: SLSShowSpacesFunc.self)
+        // Try modern SLS name first, then older CGS name
+        if let fn = dlsym(handle, "SLSCopySpaces") {
+            self.copySpaces = unsafeBitCast(fn, to: SLSCopySpacesFunc.self)
+        } else if let fn = dlsym(handle, "CGSCopySpaces") {
+            self.copySpaces = unsafeBitCast(fn, to: SLSCopySpacesFunc.self)
+        } else {
+            self.copySpaces = nil
+        }
         // Try modern SLS name first, then older CGS name
         if let fn = dlsym(handle, "SLSCopySpacesForWindows") {
             self.copySpacesForWindows = unsafeBitCast(fn, to: SLSCopySpacesForWindowsFunc.self)
@@ -165,6 +177,22 @@ class OverlayManager {
                 self?.updateVisibility()
             }
             .store(in: &cancellables)
+        
+        WindowManager.shared.$hasFullscreenWindow
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] hasFullscreen in
+                guard let self = self else { return }
+                // Hide the bar on the current space when a fullscreen window is present.
+                if let currentSpace = WindowManager.shared.currentSpaceID,
+                   let window = self.barWindows[currentSpace] {
+                    if hasFullscreen {
+                        window.orderOut(nil)
+                    } else if self.state?.isEnabled == true {
+                        window.orderFront(nil)
+                    }
+                }
+            }
+            .store(in: &cancellables)
 
         updateScreens()
         
@@ -212,7 +240,33 @@ class OverlayManager {
     @objc private func spaceDidChange() {
         refreshSpaceBars()
         
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+        // Fast path: get the new current space and immediately hide the bar
+        // if the frontmost app is fullscreen. This avoids the ~0.5s flash
+        // while DockManager/WindowManager do their slow enumeration.
+        var currentSpace: UInt64?
+        if let copyFn = self.sls.copyManagedDisplaySpaces,
+           let displays = copyFn(self.sls.mainConnectionID?() ?? 0)?.takeRetainedValue() as? [NSDictionary] {
+            for display in displays {
+                if let space = (display["Current Space"] as? NSDictionary)?["id64"] as? UInt64 {
+                    currentSpace = space
+                    break
+                }
+            }
+        }
+        
+        if let space = currentSpace {
+            WindowManager.shared.currentSpaceID = space
+            
+            let isFullscreen = isFrontmostAppFullscreen()
+            if isFullscreen, let window = self.barWindows[space] {
+                window.orderOut(nil)
+            } else if !isFullscreen, self.state?.isEnabled == true, let window = self.barWindows[space] {
+                window.orderFront(nil)
+            }
+        }
+        
+        // Slow path: refresh apps, windows, and definitive fullscreen state.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
             guard let self = self else { return }
             
             if let copyFn = self.sls.copyManagedDisplaySpaces,
@@ -222,19 +276,43 @@ class OverlayManager {
                     WindowManager.shared.currentSpaceID = currentSpace
                     DockManager.shared.spaceApps[currentSpace] = nil
                     DockManager.shared.updateAppsWithWindows()
+                    WindowManager.shared.updateWindows()
                     
-                    if let window = self.barWindows[currentSpace] as? BarWindow {
+                    if !WindowManager.shared.hasFullscreenWindow,
+                       let window = self.barWindows[currentSpace] as? BarWindow {
                         window.orderFront(nil)
                     }
                 }
             }
         }
     }
+    
+    /// Quick AX check: is the frontmost app currently fullscreen?
+    /// This is ~10ms vs. the 300-500ms of a full window enumeration.
+    private func isFrontmostAppFullscreen() -> Bool {
+        guard let frontmostApp = NSWorkspace.shared.frontmostApplication else { return false }
+        let appEl = AXUIElementCreateApplication(frontmostApp.processIdentifier)
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(appEl, kAXWindowsAttribute as CFString, &value) == .success,
+              let axWindows = value as? [AXUIElement] else { return false }
+        for axWindow in axWindows {
+            var fsRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(axWindow, "AXFullScreen" as CFString, &fsRef) == .success,
+               let fs = fsRef,
+               CFGetTypeID(fs) == CFBooleanGetTypeID(),
+               CFBooleanGetValue(fs as! CFBoolean) {
+                return true
+            }
+        }
+        return false
+    }
 
     private func updateVisibility() {
         guard let state = state else { return }
-        for (_, window) in barWindows {
-            if state.isEnabled {
+        for (spaceID, window) in barWindows {
+            let isCurrent = (spaceID == WindowManager.shared.currentSpaceID)
+            let shouldShow = state.isEnabled && (!isCurrent || !WindowManager.shared.hasFullscreenWindow)
+            if shouldShow {
                 window.orderFront(nil)
             } else {
                 window.orderOut(nil)
@@ -252,6 +330,20 @@ class OverlayManager {
         guard let copyFn = sls.copyManagedDisplaySpaces,
               let displays = copyFn(sls.mainConnectionID?() ?? 0)?.takeRetainedValue() as? [NSDictionary] else { return }
         
+        // Use SLSCopySpaces to identify fullscreen spaces (type 1).
+        var fullscreenSpaceIDs = Set<UInt64>()
+        if let spacesFn = sls.copySpaces,
+           let cid = sls.mainConnectionID?(),
+           let allSpaces = spacesFn(cid, 7)?.takeRetainedValue() as? [NSDictionary] {
+            for space in allSpaces {
+                if let id64 = space["id64"] as? UInt64,
+                   let typeNum = space["type"] as? NSNumber,
+                   typeNum.intValue == 1 {
+                    fullscreenSpaceIDs.insert(id64)
+                }
+            }
+        }
+        
         var newSpaceScreenMap: [UInt64: NSScreen] = [:]
         var newSpaceCurrentSpaceMap: [UInt64: UInt64] = [:]
         var newSpaceDisplayUUIDMap: [UInt64: String] = [:]
@@ -265,6 +357,9 @@ class OverlayManager {
             
             for space in spacesArray {
                 if let id64 = space["id64"] as? UInt64 {
+                    if fullscreenSpaceIDs.contains(id64) {
+                        continue
+                    }
                     currentSpaceIDs.insert(id64)
                     newSpaceScreenMap[id64] = screen
                     newSpaceCurrentSpaceMap[id64] = currentSpaceID
