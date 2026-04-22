@@ -179,6 +179,13 @@ class OverlayManager {
             object: nil
         )
         
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(spaceAppsUpdated(_:)),
+            name: NSNotification.Name("GinBar.SpaceAppsUpdated"),
+            object: nil
+        )
+        
         state.$isEnabled
             .sink { [weak self] _ in
                 self?.updateVisibility()
@@ -433,6 +440,14 @@ class OverlayManager {
     @objc private func pinnedAppsReordered() {
         for (spaceID, window) in barWindows {
             refreshBarContent(spaceID: spaceID, window: window)
+        }
+    }
+    
+    @objc private func spaceAppsUpdated(_ notification: Notification) {
+        if let spaceID = notification.userInfo?["spaceID"] as? UInt64,
+           let window = barWindows[spaceID] {
+            window.contentView?.needsDisplay = true
+            window.displayIfNeeded()
         }
     }
     

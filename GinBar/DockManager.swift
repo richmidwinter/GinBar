@@ -55,6 +55,10 @@ class DockManager: ObservableObject {
             .sink { [weak self] _ in self?.updateAppsWithWindows() }
             .store(in: &cancellables)
 
+        NotificationCenter.default.publisher(for: NSWorkspace.didActivateApplicationNotification)
+            .sink { [weak self] _ in self?.updateAppsWithWindows() }
+            .store(in: &cancellables)
+
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             self?.updateAppsWithWindows()
         }
@@ -309,10 +313,11 @@ class DockManager: ObservableObject {
         // Include isPinned in the cache key so that a pinned app gaining or
         // losing visible windows (which changes its representation count) still
         // triggers a UI update.
-        let cachedIDs = Set(cachedItems.map { "\($0.id):\($0.isPinned)" })
-        let resultIDs = Set(result.map { "\($0.id):\($0.isPinned)" })
+        let cachedIDs = Set(cachedItems.map { "\($0.id):\($0.isPinned):\($0.isActive)" })
+        let resultIDs = Set(result.map { "\($0.id):\($0.isPinned):\($0.isActive)" })
 
         guard resultIDs != cachedIDs else { return }
         spaceApps[cacheKey] = result
+        NotificationCenter.default.post(name: .init("GinBar.SpaceAppsUpdated"), object: nil, userInfo: ["spaceID": cacheKey])
     }
 }

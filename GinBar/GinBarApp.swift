@@ -2,7 +2,15 @@ import SwiftUI
 import Combine
 
 class AppDelegate: NSObject, NSApplicationDelegate {
+    private var activityToken: NSObjectProtocol?
+    
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Prevent app nap so timers keep firing when backgrounded
+        activityToken = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .idleSystemSleepDisabled],
+            reason: "GinBar bar updates"
+        )
+        
         // Accessory policy (no Dock icon), matching boringBar
         NSApp.setActivationPolicy(.accessory)
         
