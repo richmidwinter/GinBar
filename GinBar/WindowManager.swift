@@ -26,7 +26,7 @@ enum CapturePermissionStatus: Equatable {
 class WindowManager: ObservableObject {
     static let shared = WindowManager()
     @Published var windows: [WindowInfo] = []
-    @Published var selectedApp: NSRunningApplication?
+    @Published var selectedApp: BarAppItem?
     @Published var hoveredWindow: WindowInfo?
     @Published var thumbnails: [CGWindowID: NSImage] = [:]
     @Published var permissionStatus: CapturePermissionStatus = .unknown
@@ -77,7 +77,7 @@ class WindowManager: ObservableObject {
         $selectedApp
             .sink { [weak self] app in
                 guard let self = self, let app = app else { return }
-                for window in self.windows(for: app) {
+                for window in self.windows(for: app.processIdentifier) {
                     _ = self.captureThumbnail(for: window.id)
                 }
             }
@@ -317,15 +317,15 @@ class WindowManager: ObservableObject {
         }
     }
     
-    func windows(for app: NSRunningApplication) -> [WindowInfo] {
+    func windows(for pid: pid_t) -> [WindowInfo] {
         // Visible windows sorted left-to-right by screen position.
-        var visible = windows.filter { $0.pid == app.processIdentifier }
+        var visible = windows.filter { $0.pid == pid }
             .sorted { $0.frame.minX < $1.frame.minX }
         
         // Minimized windows from Accessibility API — appended on the far right.
         var minimized: [WindowInfo] = []
         
-        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        let appElement = AXUIElementCreateApplication(pid)
         var value: AnyObject?
         guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success,
               let axWindows = value as? [AXUIElement] else {
@@ -345,7 +345,7 @@ class WindowManager: ObservableObject {
             
             // Filter minimized windows by current space
             if let currentSpace = currentSpaceID {
-                let key = "\(app.processIdentifier):\(title)"
+                let key = "\(pid):\(title)"
                 if let cachedSpace = windowSpaceCache[key], cachedSpace != currentSpace {
                     continue
                 }
@@ -355,16 +355,17 @@ class WindowManager: ObservableObject {
             // Skip if already in the visible list
             if visible.contains(where: { $0.title == title }) { continue }
             
-            let key = "\(app.processIdentifier):\(title)"
+            let key = "\(pid):\(title)"
             if let cached = syntheticWindows[key] {
                 minimized.append(cached)
             } else {
                 let id = nextSyntheticID
                 nextSyntheticID += 1
+                let appName = NSRunningApplication(processIdentifier: pid)?.localizedName ?? ""
                 let info = WindowInfo(
                     id: id,
-                    pid: app.processIdentifier,
-                    appName: app.localizedName ?? "",
+                    pid: pid,
+                    appName: appName,
                     title: title,
                     frame: .zero,
                     isOnScreen: false,

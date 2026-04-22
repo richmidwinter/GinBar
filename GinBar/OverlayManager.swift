@@ -593,10 +593,11 @@ class OverlayManager {
         }
         
         // Fallback: activate an app on the target space.  macOS switches
-        // to the space containing the activated app.
+        // to the space containing the activated app.  Skip pinned apps since
+        // they may not actually have windows on this space.
         if !spaceSwitched,
-           let app = DockManager.shared.spaceApps[spaceID]?.first {
-            app.activate()
+           let app = DockManager.shared.spaceApps[spaceID]?.first(where: { !$0.isPinned }) {
+            DockManager.shared.activateApp(app)
             spaceSwitched = true
         }
         
