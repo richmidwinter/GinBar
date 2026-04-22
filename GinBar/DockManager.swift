@@ -75,6 +75,36 @@ class DockManager: ObservableObject {
         updateAppsWithWindows()
     }
 
+    func reorderPinnedApp(from: Int, to: Int) {
+        guard from != to,
+              from >= 0, from < pinnedAppsInfo.count,
+              to >= 0, to < pinnedAppsInfo.count else { return }
+        let item = pinnedAppsInfo.remove(at: from)
+        pinnedAppsInfo.insert(item, at: to)
+        savePinnedApps()
+
+        // Re-sort pinned apps in every cached space entry so all bars show
+        // the new order immediately (updateAppsWithWindows() only updates
+        // spaceApps[currentSpace], so other bars would stay stale).
+        var newSpaceApps = spaceApps
+        for (spaceID, apps) in newSpaceApps {
+            var updated = apps
+            updated.sort { a, b in
+                if a.isPinned != b.isPinned { return a.isPinned && !b.isPinned }
+                if a.isPinned && b.isPinned {
+                    let indexA = pinnedAppsInfo.firstIndex(where: { $0.bundleID == a.bundleIdentifier }) ?? Int.max
+                    let indexB = pinnedAppsInfo.firstIndex(where: { $0.bundleID == b.bundleIdentifier }) ?? Int.max
+                    return indexA < indexB
+                }
+                return a.name.localizedStandardCompare(b.name) == .orderedAscending
+            }
+            newSpaceApps[spaceID] = updated
+        }
+        spaceApps = newSpaceApps
+
+        NotificationCenter.default.post(name: .init("GinBar.PinnedAppsReordered"), object: nil)
+    }
+
     func isPinned(bundleID: String) -> Bool {
         pinnedAppsInfo.contains(where: { $0.bundleID == bundleID })
     }
@@ -263,10 +293,15 @@ class DockManager: ObservableObject {
             }
         }
 
-        // Sort: pinned first, then alphabetically
-        result.sort {
-            if $0.isPinned != $1.isPinned { return $0.isPinned && !$1.isPinned }
-            return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        // Sort: pinned apps in pinnedAppsInfo order, then non-pinned apps alphabetically
+        result.sort { a, b in
+            if a.isPinned != b.isPinned { return a.isPinned && !b.isPinned }
+            if a.isPinned && b.isPinned {
+                let indexA = pinnedAppsInfo.firstIndex(where: { $0.bundleID == a.bundleIdentifier }) ?? Int.max
+                let indexB = pinnedAppsInfo.firstIndex(where: { $0.bundleID == b.bundleIdentifier }) ?? Int.max
+                return indexA < indexB
+            }
+            return a.name.localizedStandardCompare(b.name) == .orderedAscending
         }
 
         let cacheKey = currentSpace ?? 0

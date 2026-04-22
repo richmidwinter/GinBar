@@ -13,6 +13,8 @@ struct BarView: View {
     /// ensures the bar always renders the latest spaceApps cache.
     @State private var refreshTick = 0
 
+    @State private var draggedPinnedBundleID: String?
+
     var body: some View {
         let _ = refreshTick
         let apps = dockManager.spaceApps[spaceID] ?? []
@@ -28,13 +30,38 @@ struct BarView: View {
                 .padding(.horizontal, 4)
 
             // Pinned apps: icon only, no names or counts
-            ForEach(pinnedApps) { app in
-                PinnedAppIconView(
-                    app: app,
-                    dockManager: dockManager
-                )
-                .onTapGesture {
-                    dockManager.activateApp(app)
+            if !pinnedApps.isEmpty {
+                HStack(spacing: 0) {
+                    PinnedDropZone(
+                        index: 0,
+                        draggedBundleID: $draggedPinnedBundleID,
+                        dockManager: dockManager,
+                        onReordered: { refreshTick += 1 }
+                    )
+
+                    ForEach(Array(pinnedApps.enumerated()), id: \.element.id) { index, app in
+                        PinnedAppIconView(
+                            app: app,
+                            dockManager: dockManager
+                        )
+                        .onDrag {
+                            if let bundleID = app.bundleIdentifier {
+                                draggedPinnedBundleID = bundleID
+                                return NSItemProvider(object: bundleID as NSString)
+                            }
+                            return NSItemProvider()
+                        }
+                        .onTapGesture {
+                            dockManager.activateApp(app)
+                        }
+
+                        PinnedDropZone(
+                            index: index + 1,
+                            draggedBundleID: $draggedPinnedBundleID,
+                            dockManager: dockManager,
+                            onReordered: { refreshTick += 1 }
+                        )
+                    }
                 }
             }
 
@@ -244,6 +271,43 @@ struct PinnedAppIconContainer: NSViewRepresentable {
 
             window.orderFront(nil)
             tooltipWindow = window
+        }
+    }
+}
+
+// MARK: - Drag-and-drop drop zone for pinned app reordering
+
+struct PinnedDropZone: View {
+    let index: Int
+    @Binding var draggedBundleID: String?
+    let dockManager: DockManager
+    let onReordered: () -> Void
+
+    @State private var isTargeted = false
+
+    var body: some View {
+        ZStack {
+            Color.clear
+            Rectangle()
+                .fill(isTargeted ? Color.white : Color.clear)
+                .frame(width: 2, height: 20)
+        }
+        .frame(width: 2, height: 24)
+        .onDrop(of: ["public.plain-text"], isTargeted: $isTargeted) { providers in
+            guard let draggedID = draggedBundleID else { return false }
+
+            let pinnedIDs = dockManager.pinnedBundleIDs
+            guard let fromIndex = pinnedIDs.firstIndex(of: draggedID) else { return false }
+
+            var toIndex = index
+            if fromIndex < toIndex {
+                toIndex -= 1
+            }
+
+            dockManager.reorderPinnedApp(from: fromIndex, to: toIndex)
+            draggedBundleID = nil
+            onReordered()
+            return true
         }
     }
 }

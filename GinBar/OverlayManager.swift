@@ -172,6 +172,13 @@ class OverlayManager {
             object: nil
         )
         
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(pinnedAppsReordered),
+            name: NSNotification.Name("GinBar.PinnedAppsReordered"),
+            object: nil
+        )
+        
         state.$isEnabled
             .sink { [weak self] _ in
                 self?.updateVisibility()
@@ -423,6 +430,29 @@ class OverlayManager {
         return NSScreen.screens.first
     }
 
+    @objc private func pinnedAppsReordered() {
+        for (spaceID, window) in barWindows {
+            refreshBarContent(spaceID: spaceID, window: window)
+        }
+    }
+    
+    private func refreshBarContent(spaceID: UInt64, window: NSWindow) {
+        guard let state = state,
+              let screen = window.screen else { return }
+        let barHeight = NSStatusBar.system.thickness + 10
+        let view = BarView(barHeight: barHeight, spaceID: spaceID)
+            .environmentObject(state)
+        let hosting = BarHostingView(rootView: view)
+        hosting.frame = NSRect(x: 0, y: 0, width: screen.frame.width, height: barHeight)
+        hosting.autoresizingMask = [.width, .height]
+        
+        let contentView = BarContentView()
+        contentView.frame = NSRect(x: 0, y: 0, width: screen.frame.width, height: barHeight)
+        contentView.addSubview(hosting)
+        window.contentView = contentView
+        window.display()
+    }
+    
     private func createBarWindow(for spaceID: UInt64, screen: NSScreen) {
         let barHeight = NSStatusBar.system.thickness + 10
         
