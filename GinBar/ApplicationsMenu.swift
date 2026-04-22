@@ -319,6 +319,14 @@ struct ApplicationsMenuContent: View {
                             .padding(.vertical, 4)
                     }
 
+                    if !applications.isEmpty && searchText.isEmpty {
+                        Text("Applications")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.5))
+                            .padding(.horizontal, 8)
+                            .padding(.top, 4)
+                    }
+
                     let displayedApps = searchText.isEmpty ? applications : filteredApplications
 
                     ForEach(displayedApps, id: \.self) { url in
