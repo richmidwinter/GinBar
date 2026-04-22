@@ -1,6 +1,17 @@
 import SwiftUI
 import AppKit
 
+// MARK: - Data Model
+
+struct AppMenuEntry: Identifiable, Equatable {
+    let id = UUID()
+    let url: URL
+    let isFolder: Bool
+    let children: [URL]
+}
+
+// MARK: - Windows
+
 final class MenuWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
@@ -10,12 +21,13 @@ final class MenuWindowController {
     static let shared = MenuWindowController()
 
     private var window: NSWindow?
+    private var submenuWindow: NSWindow?
     private var monitor: Any?
     private var isHiding = false
 
     var isVisible: Bool { window?.isVisible == true }
 
-    func show(relativeTo button: NSButton, applications: [URL], pinnedBundleIDs: [String]) {
+    func show(relativeTo button: NSButton, applications: [AppMenuEntry], pinnedBundleIDs: [String]) {
         if isVisible { hide() }
 
         guard let screen = button.window?.screen ?? NSScreen.main else { return }
@@ -29,16 +41,18 @@ final class MenuWindowController {
         )
 
         let pinnedSet = Set(pinnedBundleIDs)
-        let pinnedApps = applications.filter { url in
-            if let bundleID = Bundle(url: url)?.bundleIdentifier {
-                return pinnedSet.contains(bundleID)
-            }
-            return false
+        let pinnedApps: [AppMenuEntry] = applications.compactMap { entry in
+            guard !entry.isFolder,
+                  let bundleID = Bundle(url: entry.url)?.bundleIdentifier,
+                  pinnedSet.contains(bundleID) else { return nil }
+            return entry
         }
-        let otherApps = applications.filter { !pinnedApps.contains($0) }
+        let otherApps = applications.filter { entry in
+            !pinnedApps.contains(where: { $0.id == entry.id })
+        }
 
         let view = ApplicationsMenuContent(
-            pinnedApplications: pinnedApps,
+            pinnedApplications: pinnedApps.map(\.url),
             applications: otherApps
         ) { [weak self] url in
             NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
@@ -68,9 +82,85 @@ final class MenuWindowController {
         }
     }
 
+    private var submenuHideTimer: Timer?
+    var submenuFrame: NSRect? { submenuWindow?.frame }
+
+    func showSubmenu(for entry: AppMenuEntry, at screenRect: NSRect) {
+        cancelSubmenuHideTimer()
+        hideSubmenu()
+
+        let apps = entry.children
+        let width: CGFloat = 200
+        let rowHeight: CGFloat = 28
+        let menuHeight = min(CGFloat(apps.count) * rowHeight + 16, 400)
+
+        var x = screenRect.maxX - 2 // slight overlap so mouse path is continuous
+        var y = screenRect.maxY - menuHeight
+
+        if let screen = NSScreen.main {
+            let visible = screen.visibleFrame
+            if x + width > visible.maxX {
+                x = screenRect.minX - width + 2
+            }
+            if y < visible.minY {
+                y = visible.minY
+            }
+        }
+
+        let frame = NSRect(x: x, y: y, width: width, height: menuHeight)
+
+        let view = SubmenuContent(apps: apps) { [weak self] url in
+            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+            self?.hide()
+        }
+
+        let hosting = NSHostingView(rootView: view)
+        hosting.frame = NSRect(origin: .zero, size: frame.size)
+
+        let wrapper = SubmenuTrackingView(frame: hosting.bounds)
+        wrapper.addSubview(hosting)
+        hosting.autoresizingMask = [.width, .height]
+
+        let window = MenuWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        window.level = NSWindow.Level.statusBar + 2
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = true
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        window.contentView = wrapper
+        window.orderFront(nil)
+
+        submenuWindow = window
+    }
+
+    func scheduleSubmenuHide() {
+        cancelSubmenuHideTimer()
+        submenuHideTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            let mouseLoc = NSEvent.mouseLocation
+            if let frame = self.submenuFrame, NSPointInRect(mouseLoc, frame) {
+                // mouse is over submenu — don't hide, it'll be re-scheduled on exit
+                return
+            }
+            self.hideSubmenu()
+        }
+    }
+
+    func cancelSubmenuHideTimer() {
+        submenuHideTimer?.invalidate()
+        submenuHideTimer = nil
+    }
+
+    func hideSubmenu() {
+        cancelSubmenuHideTimer()
+        submenuWindow?.orderOut(nil)
+        submenuWindow = nil
+    }
+
     func hide() {
         guard !isHiding else { return }
         isHiding = true
+        hideSubmenu()
         if let mon = monitor {
             NSEvent.removeMonitor(mon)
             monitor = nil
@@ -80,8 +170,10 @@ final class MenuWindowController {
     }
 }
 
+// MARK: - Menu Button
+
 final class MenuButton: NSButton {
-    var applications: [URL] = []
+    var applications: [AppMenuEntry] = []
     var pinnedBundleIDs: [String] = []
     private var isHovered = false {
         didSet { updateAppearance() }
@@ -145,7 +237,7 @@ final class MenuButton: NSButton {
         dismissTooltip()
     }
 
-    // MARK: - Custom tooltip (AppKit toolTip doesn't work inside NSHostingView)
+    // MARK: - Custom tooltip
 
     private var tooltipWindow: NSWindow?
     private var tooltipTimer: Timer?
@@ -223,8 +315,10 @@ final class MenuButton: NSButton {
     }
 }
 
+// MARK: - Applications Menu
+
 struct ApplicationsMenu: View {
-    @State private var applications: [URL] = []
+    @State private var applications: [AppMenuEntry] = []
     @ObservedObject private var dockManager = DockManager.shared
 
     var body: some View {
@@ -235,7 +329,7 @@ struct ApplicationsMenu: View {
             }
     }
 
-    private func loadApplications() -> [URL] {
+    private func loadApplications() -> [AppMenuEntry] {
         let fileManager = FileManager.default
         let applicationDirectories = [
             "/Applications",
@@ -243,56 +337,96 @@ struct ApplicationsMenu: View {
             NSHomeDirectory() + "/Applications"
         ]
 
-        var foundApps = Set<URL>()
+        var entries: [AppMenuEntry] = []
+        var seenURLs = Set<URL>()
 
-        // Recursively enumerate each directory for .app bundles
         for directory in applicationDirectories {
-            let url = URL(fileURLWithPath: directory)
-            guard fileManager.fileExists(atPath: directory) else { continue }
+            let dirURL = URL(fileURLWithPath: directory)
+            guard fileManager.fileExists(atPath: directory),
+                  let contents = try? fileManager.contentsOfDirectory(
+                      at: dirURL,
+                      includingPropertiesForKeys: [.isDirectoryKey],
+                      options: [.skipsHiddenFiles]
+                  ) else { continue }
 
-            if let enumerator = fileManager.enumerator(
-                at: url,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
-            ) {
-                for case let fileURL as URL in enumerator {
-                    if fileURL.pathExtension == "app" {
-                        foundApps.insert(fileURL)
-                        // Don't descend into app bundles themselves
-                        enumerator.skipDescendants()
+            let isSystemDir = directory == "/System/Applications"
+
+            for url in contents {
+                if url.lastPathComponent.hasPrefix(".") { continue }
+
+                var isDir: ObjCBool = false
+                guard fileManager.fileExists(atPath: url.path, isDirectory: &isDir) else { continue }
+
+                if url.pathExtension == "app" {
+                    if seenURLs.insert(url).inserted {
+                        entries.append(AppMenuEntry(url: url, isFolder: false, children: []))
+                    }
+                } else if isDir.boolValue {
+                    let appsInDir = findApps(in: url, fileManager: fileManager)
+                    let newApps = appsInDir.filter { seenURLs.insert($0).inserted }
+
+                    if isSystemDir && !newApps.isEmpty {
+                        // System subdirectories (e.g. Utilities) become folder entries
+                        entries.append(AppMenuEntry(url: url, isFolder: true, children: newApps))
+                    } else {
+                        // User subdirectories are flattened — apps appear individually
+                        for appURL in newApps {
+                            entries.append(AppMenuEntry(url: appURL, isFolder: false, children: []))
+                        }
                     }
                 }
             }
         }
 
-        // CoreServices contains user-facing apps (Finder, Screen Sharing, etc.)
-        // alongside background services (Dock, SystemUIServer). Read Info.plist
-        // to filter out background-only agents.
+        // CoreServices contains user-facing apps alongside background services.
         let coreServicesURL = URL(fileURLWithPath: "/System/Library/CoreServices")
-        if let enumerator = fileManager.enumerator(
+        if let contents = try? fileManager.contentsOfDirectory(
             at: coreServicesURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for url in contents {
+                if url.pathExtension == "app" {
+                    let infoPlistURL = url.appendingPathComponent("Contents/Info.plist")
+                    if let plist = NSDictionary(contentsOf: infoPlistURL) as? [String: Any] {
+                        let isBackground = (plist["LSBackgroundOnly"] as? Bool) == true
+                        let isUIElement  = (plist["LSUIElement"] as? Bool) == true
+                        if isBackground || isUIElement { continue }
+                    }
+                    if seenURLs.insert(url).inserted {
+                        entries.append(AppMenuEntry(url: url, isFolder: false, children: []))
+                    }
+                }
+            }
+        }
+
+        // Sort folders and apps together alphabetically by display name
+        return entries.sorted {
+            let name0 = $0.isFolder
+                ? $0.url.lastPathComponent
+                : $0.url.deletingPathExtension().lastPathComponent
+            let name1 = $1.isFolder
+                ? $1.url.lastPathComponent
+                : $1.url.deletingPathExtension().lastPathComponent
+            return name0.localizedStandardCompare(name1) == .orderedAscending
+        }
+    }
+
+    private func findApps(in directory: URL, fileManager: FileManager) -> [URL] {
+        var apps: [URL] = []
+        if let enumerator = fileManager.enumerator(
+            at: directory,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
         ) {
             for case let fileURL as URL in enumerator {
                 if fileURL.pathExtension == "app" {
+                    apps.append(fileURL)
                     enumerator.skipDescendants()
-
-                    let infoPlistURL = fileURL.appendingPathComponent("Contents/Info.plist")
-                    if let plist = NSDictionary(contentsOf: infoPlistURL) as? [String: Any] {
-                        let isBackground = (plist["LSBackgroundOnly"] as? Bool) == true
-                        let isUIElement  = (plist["LSUIElement"] as? Bool) == true
-                        if !isBackground && !isUIElement {
-                            foundApps.insert(fileURL)
-                        }
-                    } else {
-                        foundApps.insert(fileURL)
-                    }
                 }
             }
         }
-
-        return Array(foundApps).sorted {
+        return apps.sorted {
             $0.deletingPathExtension().lastPathComponent.localizedStandardCompare(
                 $1.deletingPathExtension().lastPathComponent
             ) == .orderedAscending
@@ -301,7 +435,7 @@ struct ApplicationsMenu: View {
 }
 
 struct RepresentedButton: NSViewRepresentable {
-    let applications: [URL]
+    let applications: [AppMenuEntry]
     let pinnedBundleIDs: [String]
 
     func makeNSView(context: Context) -> MenuButton {
@@ -317,20 +451,24 @@ struct RepresentedButton: NSViewRepresentable {
     }
 }
 
+// MARK: - Menu Content
+
 struct ApplicationsMenuContent: View {
     let pinnedApplications: [URL]
-    let applications: [URL]
+    let applications: [AppMenuEntry]
     let onSelect: (URL) -> Void
     @State private var hoveredURL: URL?
     @State private var searchText: String = ""
 
-    private var allApplications: [URL] {
-        pinnedApplications + applications
+    private var allAppURLs: [URL] {
+        pinnedApplications + applications.flatMap { entry in
+            entry.isFolder ? entry.children : [entry.url]
+        }
     }
 
     private var filteredApplications: [URL] {
-        if searchText.isEmpty { return allApplications }
-        return allApplications.filter {
+        if searchText.isEmpty { return allAppURLs }
+        return allAppURLs.filter {
             $0.deletingPathExtension().lastPathComponent.localizedCaseInsensitiveContains(searchText)
         }
     }
@@ -363,10 +501,18 @@ struct ApplicationsMenuContent: View {
                             .padding(.top, 4)
                     }
 
-                    let displayedApps = searchText.isEmpty ? applications : filteredApplications
-
-                    ForEach(displayedApps, id: \.self) { url in
-                        appButton(for: url)
+                    if searchText.isEmpty {
+                        ForEach(applications) { entry in
+                            if entry.isFolder {
+                                FolderMenuRow(entry: entry)
+                            } else {
+                                appButton(for: entry.url)
+                            }
+                        }
+                    } else {
+                        ForEach(filteredApplications, id: \.self) { url in
+                            appButton(for: url)
+                        }
                     }
                 }
                 .padding(.vertical, 8)
@@ -425,5 +571,178 @@ struct ApplicationsMenuContent: View {
         .onHover { hovering in
             hoveredURL = hovering ? url : nil
         }
+    }
+}
+
+// MARK: - Folder Row (AppKit for reliable hover + submenu)
+
+final class FolderRowView: NSView {
+    override var intrinsicContentSize: NSSize {
+        return NSSize(width: 220, height: 28)
+    }
+}
+
+final class SubmenuTrackingView: NSView {
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach { removeTrackingArea($0) }
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways],
+            owner: self,
+            userInfo: nil
+        ))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        MenuWindowController.shared.cancelSubmenuHideTimer()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        MenuWindowController.shared.scheduleSubmenuHide()
+    }
+}
+
+struct FolderMenuRow: NSViewRepresentable {
+    let entry: AppMenuEntry
+
+    func makeNSView(context: Context) -> NSView {
+        let container = FolderRowView(frame: NSRect(x: 0, y: 0, width: 220, height: 28))
+        container.wantsLayer = true
+
+        // Folder icon
+        let iconView = NSImageView(frame: NSRect(x: 8, y: 6, width: 16, height: 16))
+        if let image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil) {
+            image.isTemplate = true
+            iconView.image = image
+            iconView.contentTintColor = .white
+        }
+        container.addSubview(iconView)
+
+        // Label
+        let label = NSTextField(frame: NSRect(x: 32, y: 5, width: 160, height: 18))
+        label.stringValue = entry.url.lastPathComponent
+        label.isEditable = false
+        label.isBordered = false
+        label.backgroundColor = .clear
+        label.textColor = .white
+        label.font = NSFont.systemFont(ofSize: 13)
+        container.addSubview(label)
+
+        // Chevron
+        let chevronView = NSImageView(frame: NSRect(x: 196, y: 6, width: 16, height: 16))
+        if let image = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: nil) {
+            image.isTemplate = true
+            chevronView.image = image
+            chevronView.contentTintColor = .white
+        }
+        container.addSubview(chevronView)
+
+        // Tracking area
+        let trackingArea = NSTrackingArea(
+            rect: container.bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: context.coordinator,
+            userInfo: nil
+        )
+        container.addTrackingArea(trackingArea)
+        context.coordinator.container = container
+        context.coordinator.entry = entry
+
+        return container
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.entry = entry
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(entry: entry)
+    }
+
+    class Coordinator: NSResponder {
+        var entry: AppMenuEntry
+        weak var container: NSView?
+
+        init(entry: AppMenuEntry) {
+            self.entry = entry
+            super.init()
+        }
+
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
+        }
+
+        override func mouseEntered(with event: NSEvent) {
+            MenuWindowController.shared.cancelSubmenuHideTimer()
+            if let container = container {
+                container.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.15).cgColor
+                let rectInWindow = container.convert(container.bounds, to: nil)
+                if let screenRect = container.window?.convertToScreen(rectInWindow) {
+                    MenuWindowController.shared.showSubmenu(for: entry, at: screenRect)
+                }
+            }
+        }
+
+        override func mouseExited(with event: NSEvent) {
+            if let container = container {
+                container.layer?.backgroundColor = NSColor.clear.cgColor
+            }
+            MenuWindowController.shared.scheduleSubmenuHide()
+        }
+    }
+}
+
+// MARK: - Submenu Content
+
+struct SubmenuContent: View {
+    let apps: [URL]
+    let onSelect: (URL) -> Void
+    @State private var hoveredURL: URL?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(apps, id: \.self) { url in
+                        Button(action: {
+                            onSelect(url)
+                        }) {
+                            HStack(spacing: 8) {
+                                let icon = NSWorkspace.shared.icon(forFile: url.path)
+                                Image(nsImage: icon)
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(width: 16, height: 16)
+
+                                Text(url.deletingPathExtension().lastPathComponent)
+                                    .font(.system(size: 13))
+                                    .foregroundColor(.white)
+
+                                Spacer()
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .contentShape(Rectangle())
+                            .background(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .fill(hoveredURL == url ? Color.white.opacity(0.15) : Color.clear)
+                            )
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                        .onHover { hovering in
+                            hoveredURL = hovering ? url : nil
+                        }
+                    }
+                }
+                .padding(.vertical, 8)
+            }
+        }
+        .frame(width: 200)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.black.opacity(0.4))
+                .overlay(.ultraThinMaterial)
+        )
     }
 }
