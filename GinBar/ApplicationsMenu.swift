@@ -243,23 +243,59 @@ struct ApplicationsMenu: View {
             NSHomeDirectory() + "/Applications"
         ]
 
-        var foundApps: [URL] = []
+        var foundApps = Set<URL>()
 
+        // Recursively enumerate each directory for .app bundles
         for directory in applicationDirectories {
-            guard let urls = try? fileManager.contentsOfDirectory(
-                at: URL(fileURLWithPath: directory),
-                includingPropertiesForKeys: nil,
-                options: [.skipsHiddenFiles]
-            ) else { continue }
+            let url = URL(fileURLWithPath: directory)
+            guard fileManager.fileExists(atPath: directory) else { continue }
 
-            for url in urls where url.pathExtension == "app" {
-                foundApps.append(url)
+            if let enumerator = fileManager.enumerator(
+                at: url,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ) {
+                for case let fileURL as URL in enumerator {
+                    if fileURL.pathExtension == "app" {
+                        foundApps.insert(fileURL)
+                        // Don't descend into app bundles themselves
+                        enumerator.skipDescendants()
+                    }
+                }
             }
         }
 
-        return foundApps.sorted {
-            $0.deletingPathExtension().lastPathComponent <
-            $1.deletingPathExtension().lastPathComponent
+        // CoreServices contains user-facing apps (Finder, Screen Sharing, etc.)
+        // alongside background services (Dock, SystemUIServer). Read Info.plist
+        // to filter out background-only agents.
+        let coreServicesURL = URL(fileURLWithPath: "/System/Library/CoreServices")
+        if let enumerator = fileManager.enumerator(
+            at: coreServicesURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for case let fileURL as URL in enumerator {
+                if fileURL.pathExtension == "app" {
+                    enumerator.skipDescendants()
+
+                    let infoPlistURL = fileURL.appendingPathComponent("Contents/Info.plist")
+                    if let plist = NSDictionary(contentsOf: infoPlistURL) as? [String: Any] {
+                        let isBackground = (plist["LSBackgroundOnly"] as? Bool) == true
+                        let isUIElement  = (plist["LSUIElement"] as? Bool) == true
+                        if !isBackground && !isUIElement {
+                            foundApps.insert(fileURL)
+                        }
+                    } else {
+                        foundApps.insert(fileURL)
+                    }
+                }
+            }
+        }
+
+        return Array(foundApps).sorted {
+            $0.deletingPathExtension().lastPathComponent.localizedStandardCompare(
+                $1.deletingPathExtension().lastPathComponent
+            ) == .orderedAscending
         }
     }
 }
