@@ -451,6 +451,29 @@ struct RepresentedButton: NSViewRepresentable {
     }
 }
 
+// MARK: - Menu Cache
+
+/// Caches app icons and display names to avoid repeated filesystem access
+/// during SwiftUI body re-evaluations (e.g. while scrolling).
+final class MenuCache {
+    private var icons: [URL: NSImage] = [:]
+    private var names: [URL: String] = [:]
+    
+    func icon(for url: URL) -> NSImage {
+        if let cached = icons[url] { return cached }
+        let image = NSWorkspace.shared.icon(forFile: url.path)
+        icons[url] = image
+        return image
+    }
+    
+    func name(for url: URL) -> String {
+        if let cached = names[url] { return cached }
+        let n = url.deletingPathExtension().lastPathComponent
+        names[url] = n
+        return n
+    }
+}
+
 // MARK: - Menu Content
 
 struct ApplicationsMenuContent: View {
@@ -459,6 +482,7 @@ struct ApplicationsMenuContent: View {
     let onSelect: (URL) -> Void
     @State private var hoveredURL: URL?
     @State private var searchText: String = ""
+    @State private var cache = MenuCache()
 
     private var allAppURLs: [URL] {
         pinnedApplications + applications.flatMap { entry in
@@ -547,13 +571,12 @@ struct ApplicationsMenuContent: View {
             onSelect(url)
         }) {
             HStack(spacing: 8) {
-                let icon = NSWorkspace.shared.icon(forFile: url.path)
-                Image(nsImage: icon)
+                Image(nsImage: cache.icon(for: url))
                     .resizable()
                     .scaledToFit()
                     .frame(width: 16, height: 16)
 
-                Text(url.deletingPathExtension().lastPathComponent)
+                Text(cache.name(for: url))
                     .font(.system(size: 13))
                     .foregroundColor(.white)
 
@@ -699,6 +722,7 @@ struct SubmenuContent: View {
     let apps: [URL]
     let onSelect: (URL) -> Void
     @State private var hoveredURL: URL?
+    @State private var cache = MenuCache()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -709,13 +733,12 @@ struct SubmenuContent: View {
                             onSelect(url)
                         }) {
                             HStack(spacing: 8) {
-                                let icon = NSWorkspace.shared.icon(forFile: url.path)
-                                Image(nsImage: icon)
+                                Image(nsImage: cache.icon(for: url))
                                     .resizable()
                                     .scaledToFit()
                                     .frame(width: 16, height: 16)
 
-                                Text(url.deletingPathExtension().lastPathComponent)
+                                Text(cache.name(for: url))
                                     .font(.system(size: 13))
                                     .foregroundColor(.white)
 
