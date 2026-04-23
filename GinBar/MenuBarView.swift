@@ -1,114 +1,95 @@
 import SwiftUI
-import ScreenCaptureKit
+import ApplicationServices
+import CoreGraphics
 
 struct MenuBarView: View {
-    @EnvironmentObject var state: AppState
-    @ObservedObject private var windowManager = WindowManager.shared
-    @State private var captureResult = ""
-    
-    private var isRunningInPreview: Bool {
-        windowManager.isRunningInPreview
+    @State private var menuOpenCount = 0
+
+    private var screenRecordingStatus: PermissionStatus {
+        CGPreflightScreenCaptureAccess() ? .granted : .denied
+    }
+
+    private var accessibilityStatus: PermissionStatus {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false]
+        return AXIsProcessTrustedWithOptions(options as CFDictionary) ? .granted : .denied
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Toggle("Enabled", isOn: $state.isEnabled)
-            
+        let _ = menuOpenCount
+
+        VStack(spacing: 0) {
+            PermissionRow(
+                title: "Screen Recording",
+                status: screenRecordingStatus,
+                settingsURL: URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!
+            )
+
             Divider()
-            
-            HStack {
-                Text("Screen Capture:")
-                Spacer()
-                permissionStatusView
-            }
-            
-            if windowManager.isRunningInPreview {
-                Text("Preview mode — captures disabled")
-                    .font(.caption)
-                    .foregroundColor(.blue)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            
-            Button("Refresh Permission") {
-                windowManager.refreshPermission()
-            }
-            
-            if !captureResult.isEmpty {
-                Text(captureResult)
-                    .font(.caption)
-                    .foregroundColor(captureResult.contains("Error") ? .red : .green)
-            }
-            
-            Button("Test Capture") {
-                testCapture()
-            }
-            
-            Text("System Settings → Privacy & Security → Screen Recording")
-                .font(.caption)
-                .foregroundColor(.secondary)
-            
+                .padding(.vertical, 4)
+
+            PermissionRow(
+                title: "Accessibility",
+                status: accessibilityStatus,
+                settingsURL: URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+            )
+
             Divider()
-            
+                .padding(.vertical, 4)
+
             Button("Quit") {
                 NSApp.terminate(nil)
             }
+            .padding(.vertical, 3)
         }
-        .padding()
-        .frame(width: 260)
-    }
-    
-    @ViewBuilder
-    private var permissionStatusView: some View {
-        switch windowManager.effectivePermissionStatus {
-        case .unknown:
-            Label("Checking...", systemImage: "questionmark.circle")
-                .foregroundColor(.orange)
-        case .granted:
-            Label(windowManager.isRunningInPreview ? "Preview" : "Granted", systemImage: windowManager.isRunningInPreview ? "eye.circle.fill" : "checkmark.circle.fill")
-                .foregroundColor(windowManager.isRunningInPreview ? .blue : .green)
-        case .denied:
-            Label("Denied", systemImage: "xmark.circle.fill")
-                .foregroundColor(.red)
-        }
-    }
-    
-    private func testCapture() {
-        guard !isRunningInPreview else {
-            captureResult = "Preview mode"
-            return
-        }
-        captureResult = "Testing..."
-        Task {
-            do {
-                let content = try await SCShareableContent.current
-                if let firstWindow = content.windows.first {
-                    let filter = SCContentFilter(desktopIndependentWindow: firstWindow)
-                    let config = SCStreamConfiguration()
-                    config.width = 320
-                    config.height = 200
-                    
-                    let image = try await SCScreenshotManager.captureImage(
-                        contentFilter: filter,
-                        configuration: config
-                    )
-                    
-                    await MainActor.run {
-                        captureResult = "Success! Captured \(image.width)x\(image.height) image"
-                    }
-                } else {
-                    await MainActor.run {
-                        captureResult = "Error: No windows found"
-                    }
-                }
-            } catch {
-                await MainActor.run {
-                    captureResult = "Error: \(error.localizedDescription)"
-                }
-            }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
+        .frame(width: 240)
+        .onAppear {
+            menuOpenCount += 1
         }
     }
 }
 
-extension Notification.Name {
-    static let refreshCapturePermission = Notification.Name("refreshCapturePermission")
+enum PermissionStatus: Equatable {
+    case granted
+    case denied
+
+    var label: String {
+        switch self {
+        case .granted: return "Granted"
+        case .denied:  return "Required"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .granted: return .green
+        case .denied:  return .red
+        }
+    }
+}
+
+private struct PermissionRow: View {
+    let title: String
+    let status: PermissionStatus
+    let settingsURL: URL
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(title)
+                .font(.system(size: 13))
+
+            Text(status.label)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(status.color)
+
+            if status == .denied {
+                Button("Open Settings...") {
+                    NSWorkspace.shared.open(settingsURL)
+                }
+                .controlSize(.small)
+                .buttonStyle(BorderedButtonStyle())
+            }
+        }
+    }
 }
