@@ -400,41 +400,111 @@ struct AppItemView: View {
 
 extension Notification.Name {
     static let appChipHovered = Notification.Name("appChipHovered")
+    static let spaceChipHovered = Notification.Name("spaceChipHovered")
 }
 
 struct WindowPreviewPopup: View {
     @ObservedObject var windowManager: WindowManager
 
     var body: some View {
-        if let app = windowManager.selectedApp {
-            let appWindows = windowManager.windows(for: app.processIdentifier)
+        if let spaceID = windowManager.selectedSpace {
+            SpacePreviewView(spaceID: spaceID, windowManager: windowManager)
+        } else if let app = windowManager.selectedApp {
+            AppPreviewView(app: app, windowManager: windowManager)
+        }
+    }
+}
 
-            HStack(spacing: 12) {
-                if appWindows.isEmpty {
-                    Text("No windows for \(app.name)")
-                        .font(.system(size: 12))
-                        .foregroundColor(.white)
-                        .frame(minWidth: 160, minHeight: 100)
-                } else {
-                    ForEach(appWindows) { window in
-                        WindowThumbnailView(window: window, windowManager: windowManager)
+struct SpacePreviewView: View {
+    let spaceID: UInt64
+    @ObservedObject var windowManager: WindowManager
+    
+    private var isCurrentSpace: Bool {
+        spaceID == windowManager.currentSpaceID
+    }
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            let screenshot = windowManager.spaceScreenshots[spaceID]
+            if let screenshot = screenshot {
+                Image(nsImage: screenshot)
+                    .resizable()
+                    .scaledToFit()
+                    .cornerRadius(6)
+            } else if isCurrentSpace {
+                HStack {
+                    Spacer()
+                    VStack(spacing: 8) {
+                        ProgressView()
+                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                        Text("Capturing…")
+                            .font(.system(size: 11))
+                            .foregroundColor(.white.opacity(0.7))
                     }
+                    Spacer()
+                }
+                .frame(minWidth: 200, minHeight: 120)
+            } else {
+                HStack {
+                    Spacer()
+                    Text("No preview")
+                        .font(.system(size: 11))
+                        .foregroundColor(.white.opacity(0.7))
+                        .frame(minWidth: 200, minHeight: 120)
+                    Spacer()
                 }
             }
-            .padding(.vertical, 12)
-            .padding(.horizontal, 12)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color.black.opacity(0.6))
-                    .overlay(.ultraThinMaterial)
-            )
-            .onHover { hovering in
-                windowManager.isPopupHovered = hovering
-                if hovering {
-                    windowManager.cancelHidePopupTimer()
-                } else {
-                    windowManager.scheduleHidePopup()
+        }
+        .padding(.vertical, 12)
+        .padding(.horizontal, 12)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.black.opacity(0.6))
+                .overlay(.ultraThinMaterial)
+        )
+        .onHover { hovering in
+            windowManager.isPopupHovered = hovering
+            if hovering {
+                windowManager.cancelHidePopupTimer()
+            } else {
+                windowManager.scheduleHidePopup()
+            }
+        }
+    }
+}
+
+struct AppPreviewView: View {
+    let app: BarAppItem
+    @ObservedObject var windowManager: WindowManager
+    
+    var body: some View {
+        let appWindows = windowManager.windows(for: app.processIdentifier)
+
+        HStack(spacing: 12) {
+            if appWindows.isEmpty {
+                Text("No windows for \(app.name)")
+                    .font(.system(size: 12))
+                    .foregroundColor(.white)
+                    .frame(minWidth: 160, minHeight: 100)
+            } else {
+                ForEach(appWindows) { window in
+                    WindowThumbnailView(window: window, windowManager: windowManager)
                 }
+            }
+        }
+        .padding(.vertical, 12)
+        .padding(.horizontal, 12)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.black.opacity(0.6))
+                .overlay(.ultraThinMaterial)
+        )
+        .onHover { hovering in
+            windowManager.isPopupHovered = hovering
+            if hovering {
+                windowManager.cancelHidePopupTimer()
+            } else {
+                windowManager.scheduleHidePopup()
             }
         }
     }

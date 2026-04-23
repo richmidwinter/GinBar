@@ -33,12 +33,15 @@ class WindowManager: ObservableObject {
     @Published var isPopupHovered: Bool = false
     @Published var currentSpaceID: UInt64?
     @Published var hasFullscreenWindow: Bool = false
+    @Published var selectedSpace: UInt64? = nil
+    @Published var spaceScreenshots: [UInt64: NSImage] = [:]
     
     var onSwitchToSpace: ((UInt64) -> Void)?
     
     private var timer: Timer?
     private var hidePopupTimer: Timer?
     private var adjustTimer: Timer?
+    private var spaceScreenshotTimer: Timer?
     private var hasPromptedForAccessibility = false
     private var barHeight: CGFloat = 0
     private var cancellables = Set<AnyCancellable>()
@@ -46,6 +49,7 @@ class WindowManager: ObservableObject {
     private var syntheticWindows: [String: WindowInfo] = [:]
     private var windowSpaceCache: [String: UInt64] = [:]
     private var thumbnailCaptureTime: [CGWindowID: Date] = [:]
+    private var lastDisplayIDForScreenshot: CGDirectDisplayID?
     private let sls = SkyLightAPIs.shared
     
     var isRunningInPreview: Bool {
@@ -72,6 +76,7 @@ class WindowManager: ObservableObject {
             permissionStatus = .granted
         } else {
             startMonitoring()
+            startSpaceScreenshotTimer()
         }
         
         $selectedApp
@@ -87,6 +92,7 @@ class WindowManager: ObservableObject {
     deinit {
         timer?.invalidate()
         hidePopupTimer?.invalidate()
+        spaceScreenshotTimer?.invalidate()
         axCleanupTimer?.invalidate()
         for (_, obs) in axObservers {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .defaultMode)
@@ -101,6 +107,7 @@ class WindowManager: ObservableObject {
                 guard let self = self else { return }
                 if !self.isPopupHovered && self.hoveredWindow == nil {
                     self.selectedApp = nil
+                    self.selectedSpace = nil
                 }
             }
         }
@@ -131,10 +138,71 @@ class WindowManager: ObservableObject {
     @objc private func spaceDidChange() {
         // log removed
         selectedApp = nil // hide popup when switching spaces
+        selectedSpace = nil
+        if let spaceID = currentSpaceID {
+            captureSpaceScreenshot(for: spaceID)
+        }
         // Defer so OverlayManager has a chance to update currentSpaceID
         // before we cache visible windows against the wrong space.
         DispatchQueue.main.async { [weak self] in
             self?.updateWindows()
+        }
+    }
+    
+    func captureSpaceScreenshot(for spaceID: UInt64, displayID: CGDirectDisplayID? = nil) {
+        guard spaceID == currentSpaceID else { return }
+        if let displayID = displayID {
+            lastDisplayIDForScreenshot = displayID
+        }
+        Task {
+            await captureSpaceScreenshotAsync(for: spaceID, displayID: lastDisplayIDForScreenshot)
+        }
+    }
+    
+    private func captureSpaceScreenshotAsync(for spaceID: UInt64, displayID: CGDirectDisplayID? = nil) async {
+        guard !isRunningInPreview else { return }
+        do {
+            let content = try await SCShareableContent.current
+            
+            let display: SCDisplay
+            if let displayID = displayID,
+               let found = content.displays.first(where: { $0.displayID == displayID }) {
+                display = found
+            } else {
+                guard let first = content.displays.first else { return }
+                display = first
+            }
+            
+            let filter = SCContentFilter(display: display, excludingWindows: [])
+            let config = SCStreamConfiguration()
+            
+            let targetWidth: CGFloat = 400
+            let scale = targetWidth / CGFloat(display.width)
+            config.width = Int(targetWidth)
+            config.height = Int(CGFloat(display.height) * scale)
+            
+            let image = try await SCScreenshotManager.captureImage(
+                contentFilter: filter,
+                configuration: config
+            )
+            
+            let nsImage = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+            
+            await MainActor.run {
+                self.spaceScreenshots[spaceID] = nsImage
+                }
+        } catch {
+            // silently ignore repeated screenshot errors to avoid log spam
+        }
+    }
+    
+    private func startSpaceScreenshotTimer() {
+        spaceScreenshotTimer?.invalidate()
+        spaceScreenshotTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self = self, let spaceID = self.currentSpaceID else { return }
+                await self.captureSpaceScreenshotAsync(for: spaceID, displayID: self.lastDisplayIDForScreenshot)
+            }
         }
     }
     
@@ -803,13 +871,17 @@ class WindowManager: ObservableObject {
             return
         }
         
+        // Helper to read AX title
+        func axTitle(_ axWindow: AXUIElement) -> String {
+            var titleRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleRef)
+            return (titleRef as? String) ?? ""
+        }
+        
         // Synthetic IDs (>= 0xFFFF0000) are minimized windows — find by title
         if window.id >= 0xFFFF0000 {
             for axWindow in axWindows {
-                var titleRef: CFTypeRef?
-                AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleRef)
-                let title = (titleRef as? String) ?? ""
-                if title == window.title {
+                if axTitle(axWindow) == window.title {
                     AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
                     return
                 }
@@ -817,6 +889,29 @@ class WindowManager: ObservableObject {
             return
         }
         
+        // 1. Try matching by AXWindowNumber (maps to CGWindowID) — most reliable.
+        for axWindow in axWindows {
+            var windowNumRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(axWindow, "AXWindowNumber" as CFString, &windowNumRef)
+            if let num = windowNumRef as? NSNumber,
+               num.uint32Value == window.id {
+                AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
+                return
+            }
+        }
+        
+        // 2. Try matching by title (distinct titles are common and survive moves/resizes).
+        if !window.title.isEmpty {
+            for axWindow in axWindows {
+                if axTitle(axWindow) == window.title {
+                    AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
+                    return
+                }
+            }
+        }
+        
+        // 3. Fall back to frame matching with a looser tolerance so stale
+        //    CGWindowList frames still match after small moves.
         for axWindow in axWindows {
             var positionRef: CFTypeRef?
             var sizeRef: CFTypeRef?
@@ -830,10 +925,10 @@ class WindowManager: ObservableObject {
                 AXValueGetValue(sizeRef as! AXValue, .cgSize, &size)
                 let axFrame = CGRect(origin: position, size: size)
                 
-                if abs(axFrame.minX - window.frame.minX) < 5 &&
-                   abs(axFrame.minY - window.frame.minY) < 5 &&
-                   abs(axFrame.width - window.frame.width) < 5 &&
-                   abs(axFrame.height - window.frame.height) < 5 {
+                if abs(axFrame.minX - window.frame.minX) < 50 &&
+                   abs(axFrame.minY - window.frame.minY) < 50 &&
+                   abs(axFrame.width - window.frame.width) < 10 &&
+                   abs(axFrame.height - window.frame.height) < 10 {
                     AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
                     return
                 }
@@ -841,9 +936,10 @@ class WindowManager: ObservableObject {
         }
         
         // Fallback: just bring the app frontmost
+        let processName = app.localizedName ?? window.appName
         let script = """
         tell application "System Events"
-            tell process "\(window.appName)"
+            tell process "\(processName)"
                 set frontmost to true
             end tell
         end tell

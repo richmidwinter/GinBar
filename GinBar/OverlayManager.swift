@@ -167,6 +167,13 @@ class OverlayManager {
         
         NotificationCenter.default.addObserver(
             self,
+            selector: #selector(chipFrameUpdated(_:)),
+            name: .spaceChipHovered,
+            object: nil
+        )
+        
+        NotificationCenter.default.addObserver(
+            self,
             selector: #selector(updateScreens),
             name: NSApplication.didChangeScreenParametersNotification,
             object: nil
@@ -271,6 +278,15 @@ class OverlayManager {
         if let space = currentSpace {
             WindowManager.shared.currentSpaceID = space
             
+            let displayID: CGDirectDisplayID?
+            if let screen = spaceScreenMap[space],
+               let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
+                displayID = screenNumber.uint32Value
+            } else {
+                displayID = nil
+            }
+            WindowManager.shared.captureSpaceScreenshot(for: space, displayID: displayID)
+            
             let isFullscreen = isFrontmostAppFullscreen()
             if isFullscreen, let window = self.barWindows[space] {
                 window.orderOut(nil)
@@ -291,6 +307,15 @@ class OverlayManager {
                     DockManager.shared.spaceApps[currentSpace] = nil
                     DockManager.shared.updateAppsWithWindows()
                     WindowManager.shared.updateWindows()
+                    
+                    let displayID: CGDirectDisplayID?
+                    if let screen = self.spaceScreenMap[currentSpace],
+                       let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
+                        displayID = screenNumber.uint32Value
+                    } else {
+                        displayID = nil
+                    }
+                    WindowManager.shared.captureSpaceScreenshot(for: currentSpace, displayID: displayID)
                     
                     if !WindowManager.shared.hasFullscreenWindow,
                        let window = self.barWindows[currentSpace] as? BarWindow {
@@ -511,9 +536,17 @@ class OverlayManager {
 
         barWindows[spaceID] = window
         
-        // For the current space, show it immediately.
+        // A window must be ordered-in at least once before the window server
+        // assigns it a valid windowNumber. Without a valid windowNumber,
+        // SLSAddWindowsToSpaces silently fails and the bar stays on the
+        // space where it was created — causing later .managed fallback
+        // switches to land on the wrong space.
+        window.alphaValue = 0
+        window.orderFront(nil)
+        
+        // For the current space, just keep it visible.
         guard let currentSpace = spaceCurrentSpaceMap[spaceID], currentSpace != spaceID else {
-            window.orderFront(nil)
+            window.alphaValue = 1
             return
         }
         
@@ -533,11 +566,8 @@ class OverlayManager {
                 
                 if let addFn = self.sls.addWindowsToSpaces {
                     let addResult = addFn(cid, windowArray, targetSpaceArray)
-                    NSLog("[GinBar] SLSAddWindowsToSpaces space=%llu win=%d result=%d", spaceID, windowNumber, addResult)
-                    
                     if addResult == 0, let removeFn = self.sls.removeWindowsFromSpaces {
-                        let removeResult = removeFn(cid, windowArray, currentSpaceArray)
-                        NSLog("[GinBar] SLSRemoveWindowsFromSpaces space=%llu current=%llu result=%d", spaceID, currentSpace, removeResult)
+                        _ = removeFn(cid, windowArray, currentSpaceArray)
                     }
                 }
             }
@@ -545,6 +575,7 @@ class OverlayManager {
         
         // Non-current space: hide the window. It will be shown via makeKeyAndOrderFront:
         // when the user switches to this space.
+        window.alphaValue = 1
         window.orderOut(nil)
     }
     
@@ -560,8 +591,7 @@ class OverlayManager {
         )
 
         let view = WindowPreviewPopup(windowManager: WindowManager.shared)
-            .frame(height: popupHeight)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
             .padding(.bottom, 4)
         let hosting = NSHostingView(rootView: view)
         hosting.frame = NSRect(x: 0, y: 0, width: frame.width, height: frame.height)
@@ -582,19 +612,22 @@ class OverlayManager {
 
         popupWindows[screen] = window
         
-        WindowManager.shared.$selectedApp
-            .receive(on: DispatchQueue.main)
-            .sink { [weak window] app in
-                guard let window = window else { return }
-                if app != nil {
-                    window.ignoresMouseEvents = false
-                    window.orderFront(nil)
-                } else {
-                    window.ignoresMouseEvents = true
-                    window.orderOut(nil)
-                }
+        Publishers.CombineLatest(
+            WindowManager.shared.$selectedApp,
+            WindowManager.shared.$selectedSpace
+        )
+        .receive(on: DispatchQueue.main)
+        .sink { [weak window] app, space in
+            guard let window = window else { return }
+            if app != nil || space != nil {
+                window.ignoresMouseEvents = false
+                window.orderFront(nil)
+            } else {
+                window.ignoresMouseEvents = true
+                window.orderOut(nil)
             }
-            .store(in: &cancellables)
+        }
+        .store(in: &cancellables)
     }
     
     @objc private func chipFrameUpdated(_ notification: Notification) {
@@ -604,13 +637,24 @@ class OverlayManager {
         let chipMinX = barWindow.frame.minX + localMinX
         
         let barHeight = NSStatusBar.system.thickness + 10
-        let popupHeight: CGFloat = 140
+        let isSpacePreview = WindowManager.shared.selectedSpace != nil
+        let popupHeight: CGFloat = isSpacePreview ? 220 : 140
         
         for (screen, window) in popupWindows {
             guard chipMinX >= screen.frame.minX && chipMinX < screen.frame.maxX else { continue }
-            let popupWidth = max(200, screen.frame.maxX - chipMinX)
+            
+            let popupWidth: CGFloat
+            let popupX: CGFloat
+            if isSpacePreview {
+                popupWidth = min(320, screen.frame.width - 20)
+                popupX = screen.frame.maxX - popupWidth - 10
+            } else {
+                popupWidth = max(200, screen.frame.maxX - chipMinX)
+                popupX = chipMinX
+            }
+            
             let newFrame = NSRect(
-                x: chipMinX,
+                x: popupX,
                 y: screen.frame.minY + barHeight - 4,
                 width: popupWidth,
                 height: popupHeight + 4
@@ -624,46 +668,40 @@ class OverlayManager {
     }
     
     func switchToSpace(_ spaceID: UInt64) {
-        // Primary: use SLSShowSpaces — it switches to the space without
-        // touching window focus at all.
-        var spaceSwitched = false
+        // Primary: SLSSpaceSwitchToSpace — this is what Mission Control uses.
+        if let switchFn = sls.spaceSwitchToSpace,
+           let cid = sls.mainConnectionID?() {
+            if switchFn(cid, spaceID, 0) == 0 { return }
+        }
+        
+        // Fallback: SLSShowSpaces.
         if let showFn = sls.showSpaces,
            let cid = sls.mainConnectionID?() {
             var spaceIDValue = Int64(spaceID)
             if let spaceNum = CFNumberCreate(nil, .sInt64Type, &spaceIDValue) {
                 let spacesArray = [spaceNum] as CFArray
-                let result = showFn(cid, spacesArray)
-                spaceSwitched = (result == 0)
+                if showFn(cid, spacesArray) == 0 { return }
             }
         }
         
-        // Fallback: activate an app on the target space.  macOS switches
-        // to the space containing the activated app.  Skip pinned apps since
-        // they may not actually have windows on this space.
-        if !spaceSwitched,
-           let app = DockManager.shared.spaceApps[spaceID]?.first(where: { !$0.isPinned }) {
-            DockManager.shared.activateApp(app)
-            spaceSwitched = true
-        }
-        
-        // Last resort: .managed flip + makeKeyAndOrderFront.  This steals
-        // focus briefly but always triggers the space switch.
-        if !spaceSwitched {
-            if barWindows[spaceID] == nil {
-                if let screen = spaceScreenMap[spaceID] ?? NSScreen.screens.first {
-                    createBarWindow(for: spaceID, screen: screen)
-                }
+        // Fallback: use the bar window itself.  As long as the bar was
+        // properly assigned to its target space during creation, flipping
+        // it to .managed and calling makeKeyAndOrderFront will switch to
+        // that space without depending on app frontmost-window behaviour.
+        if barWindows[spaceID] == nil {
+            if let screen = spaceScreenMap[spaceID] ?? NSScreen.screens.first {
+                createBarWindow(for: spaceID, screen: screen)
             }
-            if let window = barWindows[spaceID] as? BarWindow {
-                window.collectionBehavior = [.managed, .ignoresCycle, .fullScreenAuxiliary]
-                window.allowBecomeKey = true
-                NSApp.activate(ignoringOtherApps: true)
-                window.makeKeyAndOrderFront(nil)
-                window.allowBecomeKey = false
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak window] in
-                    guard let window = window else { return }
-                    window.collectionBehavior = [.stationary, .ignoresCycle, .fullScreenAuxiliary]
-                }
+        }
+        if let window = barWindows[spaceID] as? BarWindow {
+            window.collectionBehavior = [.managed, .ignoresCycle, .fullScreenAuxiliary]
+            window.allowBecomeKey = true
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+            window.allowBecomeKey = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak window] in
+                guard let window = window else { return }
+                window.collectionBehavior = [.stationary, .ignoresCycle, .fullScreenAuxiliary]
             }
         }
     }

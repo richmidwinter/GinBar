@@ -9,6 +9,10 @@ class DockManager: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var timer: Timer?
     private let sls = SkyLightAPIs.shared
+    
+    // Cache window-to-space mappings so we don't hammer SkyLight on every tick.
+    private var windowSpaceCache: [Int: [UInt64]] = [:]
+    private var lastWindowSignature: [Int] = []
 
     private var pinnedAppsInfo: [PinnedAppInfo] = {
         if let data = UserDefaults.standard.data(forKey: "GinBar.pinnedApps"),
@@ -179,46 +183,97 @@ class DockManager: ObservableObject {
     func updateAppsWithWindows() {
         guard !isRunningInPreview else { return }
 
-        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
-        guard let windowList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
-            return
-        }
-
+        let currentPID = ProcessInfo.processInfo.processIdentifier
         let currentSpace = WindowManager.shared.currentSpaceID
+        let skyLightAvailable = sls.copySpacesForWindows != nil
 
-        var currentPIDs = Set<pid_t>()
-
-        // Collect visible PIDs.  Start with the old reliable baseline (all
-        // visible windows).  Then if we know the current space, try to refine
-        // the list with SkyLight or kCGWindowWorkspace.  If those fail we still
-        // have the baseline so the bar never goes blank.
-        for windowDict in windowList {
-            if let ownerPID = windowDict[kCGWindowOwnerPID as String] as? pid_t {
-                currentPIDs.insert(ownerPID)
+        let allApps = NSWorkspace.shared.runningApplications.filter { app in
+            if let bundleId = app.bundleIdentifier {
+                return bundleId != (Bundle.main.bundleIdentifier ?? "") && app.activationPolicy == .regular
             }
+            return app.processIdentifier != currentPID && app.activationPolicy == .regular
         }
 
-        if let space = currentSpace {
-            let skyLightAvailable = sls.copySpacesForWindows != nil
-            var filteredPIDs = Set<pid_t>()
-            var skyLightFoundAny = false
-
-            if skyLightAvailable {
-                for windowDict in windowList {
-                    guard let windowNumber = windowDict[kCGWindowNumber as String] as? Int,
-                          let ownerPID = windowDict[kCGWindowOwnerPID as String] as? pid_t else { continue }
-                    let spaces = spacesForWindow(windowNumber: windowNumber)
-                    if spaces.contains(space) {
-                        filteredPIDs.insert(ownerPID)
+        // Collect all known Mission Control spaces.
+        var allSpaceIDs = Set<UInt64>()
+        if let copyFn = sls.copyManagedDisplaySpaces,
+           let displays = copyFn(sls.mainConnectionID?() ?? 0)?.takeRetainedValue() as? [NSDictionary] {
+            for display in displays {
+                if let spacesArray = display["Spaces"] as? [NSDictionary] {
+                    for space in spacesArray {
+                        if let id64 = space["id64"] as? UInt64 {
+                            allSpaceIDs.insert(id64)
+                        }
                     }
                 }
-                if !filteredPIDs.isEmpty {
-                    currentPIDs = filteredPIDs
-                    skyLightFoundAny = true
+            }
+        }
+
+        var spacePIDMap: [UInt64: Set<pid_t>] = [:]
+
+        if skyLightAvailable {
+            // Use .optionAll so we see windows from *every* Mission Control space,
+            // then ask SkyLight which space each window belongs to.
+            let options: CGWindowListOption = [.optionAll, .excludeDesktopElements]
+            guard let windowList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+                return
+            }
+
+            var validWindows: [(windowNumber: Int, pid: pid_t)] = []
+            for windowDict in windowList {
+                guard let ownerPID = windowDict[kCGWindowOwnerPID as String] as? pid_t,
+                      let layer = windowDict[kCGWindowLayer as String] as? Int32,
+                      let bounds = windowDict[kCGWindowBounds as String] as? [String: CGFloat],
+                      let windowNumber = windowDict[kCGWindowNumber as String] as? Int else { continue }
+
+                guard ownerPID != currentPID else { continue }
+
+                let frame = CGRect(
+                    x: bounds["X"] ?? 0,
+                    y: bounds["Y"] ?? 0,
+                    width: bounds["Width"] ?? 0,
+                    height: bounds["Height"] ?? 0
+                )
+                guard frame.width >= 20, frame.height >= 20, layer < 100 else { continue }
+                guard allApps.contains(where: { $0.processIdentifier == ownerPID }) else { continue }
+
+                validWindows.append((windowNumber: windowNumber, pid: ownerPID))
+            }
+
+            // Cache SkyLight results per window so we don't call it every 0.1 s.
+            let windowListSignature = validWindows.map { $0.windowNumber }.sorted()
+            if windowListSignature != lastWindowSignature {
+                windowSpaceCache.removeAll()
+                lastWindowSignature = windowListSignature
+            }
+
+            for (windowNumber, pid) in validWindows {
+                let spaces: [UInt64]
+                if let cached = windowSpaceCache[windowNumber] {
+                    spaces = cached
+                } else {
+                    spaces = spacesForWindow(windowNumber: windowNumber)
+                    windowSpaceCache[windowNumber] = spaces
+                }
+                for spaceID in spaces where allSpaceIDs.contains(spaceID) {
+                    spacePIDMap[spaceID, default: Set<pid_t>()].insert(pid)
+                }
+            }
+        } else {
+            // Fallback when SkyLight isn't available: current space only.
+            let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+            guard let windowList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+                return
+            }
+
+            var currentPIDs = Set<pid_t>()
+            for windowDict in windowList {
+                if let ownerPID = windowDict[kCGWindowOwnerPID as String] as? pid_t {
+                    currentPIDs.insert(ownerPID)
                 }
             }
 
-            if !skyLightFoundAny {
+            if let space = currentSpace {
                 var workspaceCounts: [Int: Int] = [:]
                 var pidToWorkspace: [pid_t: Int] = [:]
                 for windowDict in windowList {
@@ -235,89 +290,87 @@ class DockManager: ObservableObject {
                     }
                 }
             }
-        }
 
-        let currentBundleId = Bundle.main.bundleIdentifier ?? ""
-        let allApps = NSWorkspace.shared.runningApplications.filter { app in
-            if let bundleId = app.bundleIdentifier {
-                return bundleId != currentBundleId && app.activationPolicy == .regular
+            if let space = currentSpace {
+                spacePIDMap[space] = currentPIDs
             }
-            return app.processIdentifier != ProcessInfo.processInfo.processIdentifier
-                && app.activationPolicy == .regular
         }
 
-        // Also include apps that have minimized windows on the current space
-        for app in allApps where !currentPIDs.contains(app.processIdentifier) {
+        // Add minimized windows via Accessibility (they don't appear in CGWindowList).
+        for app in allApps {
             let appEl = AXUIElementCreateApplication(app.processIdentifier)
             var value: AnyObject?
             guard AXUIElementCopyAttributeValue(appEl, kAXWindowsAttribute as CFString, &value) == .success,
                   let axWindows = value as? [AXUIElement] else { continue }
-            var hasMinimizedOnCurrentSpace = false
+
             for axWindow in axWindows {
                 var minimizedRef: CFTypeRef?
                 AXUIElementCopyAttributeValue(axWindow, kAXMinimizedAttribute as CFString, &minimizedRef)
-                if let minimized = minimizedRef, CFGetTypeID(minimized) == CFBooleanGetTypeID(), CFBooleanGetValue(minimized as! CFBoolean) {
-                    var titleRef: CFTypeRef?
-                    AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleRef)
-                    let title = (titleRef as? String) ?? ""
+                guard let minimized = minimizedRef,
+                      CFGetTypeID(minimized) == CFBooleanGetTypeID(),
+                      CFBooleanGetValue(minimized as! CFBoolean) else { continue }
 
-                    if let cachedSpace = WindowManager.shared.spaceIDForMinimizedWindow(pid: app.processIdentifier, title: title),
-                       cachedSpace == currentSpace {
-                        hasMinimizedOnCurrentSpace = true
-                        break
-                    } else if WindowManager.shared.spaceIDForMinimizedWindow(pid: app.processIdentifier, title: title) == nil {
-                        hasMinimizedOnCurrentSpace = true
-                        break
-                    }
+                var titleRef: CFTypeRef?
+                AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleRef)
+                let title = (titleRef as? String) ?? ""
+
+                if let cachedSpace = WindowManager.shared.spaceIDForMinimizedWindow(pid: app.processIdentifier, title: title),
+                   allSpaceIDs.contains(cachedSpace) {
+                    spacePIDMap[cachedSpace, default: Set<pid_t>()].insert(app.processIdentifier)
+                } else if let space = currentSpace, allSpaceIDs.contains(space) {
+                    // If not cached, assume current space as fallback.
+                    spacePIDMap[space, default: Set<pid_t>()].insert(app.processIdentifier)
                 }
             }
-            if hasMinimizedOnCurrentSpace {
-                currentPIDs.insert(app.processIdentifier)
+        }
+
+        // Build spaceApps for every known space.
+        var newSpaceApps = spaceApps
+        var anyChanged = false
+
+        for spaceID in allSpaceIDs {
+            let pids = spacePIDMap[spaceID] ?? Set<pid_t>()
+
+            var result: [BarAppItem] = allApps
+                .filter { pids.contains($0.processIdentifier) }
+                .map { BarAppItem(from: $0, isPinned: false) }
+
+            // Running pinned apps (always show pinned icon).
+            for app in allApps {
+                if let bundleID = app.bundleIdentifier, isPinned(bundleID: bundleID) {
+                    result.append(BarAppItem(from: app, isPinned: true))
+                }
+            }
+
+            // Non-running pinned apps.
+            for info in pinnedAppsInfo {
+                if !result.contains(where: { $0.bundleIdentifier == info.bundleID }) {
+                    result.append(BarAppItem(pinnedBundleID: info.bundleID, name: info.name, url: info.url))
+                }
+            }
+
+            // Sort: pinned first, then alphabetical.
+            result.sort { a, b in
+                if a.isPinned != b.isPinned { return a.isPinned && !b.isPinned }
+                if a.isPinned && b.isPinned {
+                    let indexA = pinnedAppsInfo.firstIndex(where: { $0.bundleID == a.bundleIdentifier }) ?? Int.max
+                    let indexB = pinnedAppsInfo.firstIndex(where: { $0.bundleID == b.bundleIdentifier }) ?? Int.max
+                    return indexA < indexB
+                }
+                return a.name.localizedStandardCompare(b.name) == .orderedAscending
+            }
+
+            let cachedItems = newSpaceApps[spaceID] ?? []
+            let cachedIDs = Set(cachedItems.map { "\($0.id):\($0.isPinned):\($0.isActive)" })
+            let resultIDs = Set(result.map { "\($0.id):\($0.isPinned):\($0.isActive)" })
+
+            if resultIDs != cachedIDs {
+                newSpaceApps[spaceID] = result
+                anyChanged = true
+                NotificationCenter.default.post(name: .init("GinBar.SpaceAppsUpdated"), object: nil, userInfo: ["spaceID": spaceID])
             }
         }
 
-        // Build the visible-apps list as BarAppItems
-        var result: [BarAppItem] = allApps
-            .filter { currentPIDs.contains($0.processIdentifier) }
-            .map { BarAppItem(from: $0, isPinned: false) }
-
-        // Add running pinned apps (always show pinned icon, even if the app
-        // also has visible windows and appears as a regular chip).
-        for app in allApps {
-            if let bundleID = app.bundleIdentifier,
-               isPinned(bundleID: bundleID) {
-                result.append(BarAppItem(from: app, isPinned: true))
-            }
-        }
-
-        // Add non-running pinned apps
-        for info in pinnedAppsInfo {
-            if !result.contains(where: { $0.bundleIdentifier == info.bundleID }) {
-                result.append(BarAppItem(pinnedBundleID: info.bundleID, name: info.name, url: info.url))
-            }
-        }
-
-        // Sort: pinned apps in pinnedAppsInfo order, then non-pinned apps alphabetically
-        result.sort { a, b in
-            if a.isPinned != b.isPinned { return a.isPinned && !b.isPinned }
-            if a.isPinned && b.isPinned {
-                let indexA = pinnedAppsInfo.firstIndex(where: { $0.bundleID == a.bundleIdentifier }) ?? Int.max
-                let indexB = pinnedAppsInfo.firstIndex(where: { $0.bundleID == b.bundleIdentifier }) ?? Int.max
-                return indexA < indexB
-            }
-            return a.name.localizedStandardCompare(b.name) == .orderedAscending
-        }
-
-        let cacheKey = currentSpace ?? 0
-        let cachedItems = spaceApps[cacheKey] ?? []
-        // Include isPinned in the cache key so that a pinned app gaining or
-        // losing visible windows (which changes its representation count) still
-        // triggers a UI update.
-        let cachedIDs = Set(cachedItems.map { "\($0.id):\($0.isPinned):\($0.isActive)" })
-        let resultIDs = Set(result.map { "\($0.id):\($0.isPinned):\($0.isActive)" })
-
-        guard resultIDs != cachedIDs else { return }
-        spaceApps[cacheKey] = result
-        NotificationCenter.default.post(name: .init("GinBar.SpaceAppsUpdated"), object: nil, userInfo: ["spaceID": cacheKey])
+        spaceApps = newSpaceApps
     }
 }

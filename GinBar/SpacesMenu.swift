@@ -4,8 +4,8 @@ import Darwin
 struct SpacesMenu: View {
     @State private var spaces: [(id: UInt64, index: Int)] = []
     @State private var currentSpaceIndex: Int = 1
-    @State private var isHovered = false
     let spaceID: UInt64
+    @ObservedObject private var windowManager = WindowManager.shared
     private let sls = SkyLightAPIs.shared
     
     var body: some View {
@@ -28,9 +28,29 @@ struct SpacesMenu: View {
                     .onTapGesture {
                         switchToSpace(space)
                     }
-                    .onHover { hovering in
-                        isHovered = hovering
-                    }
+                    .overlay(
+                        GeometryReader { geo in
+                            Color.clear
+                                .onHover { hovering in
+                                    if hovering {
+                                        windowManager.cancelHidePopupTimer()
+                                        windowManager.selectedSpace = space.id
+                                        windowManager.selectedApp = nil
+                                        let frame = geo.frame(in: .global)
+                                        NotificationCenter.default.post(
+                                            name: .spaceChipHovered,
+                                            object: nil,
+                                            userInfo: [
+                                                "spaceID": spaceID,
+                                                "localMinX": frame.minX
+                                            ]
+                                        )
+                                    } else {
+                                        windowManager.scheduleHidePopup()
+                                    }
+                                }
+                        }
+                    )
             }
         }
         .onAppear {
