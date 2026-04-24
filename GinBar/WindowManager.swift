@@ -41,7 +41,6 @@ class WindowManager: ObservableObject {
     private var timer: Timer?
     private var hidePopupTimer: Timer?
     private var adjustTimer: Timer?
-    private var spaceScreenshotTimer: Timer?
     private var hasPromptedForAccessibility = false
     private var barHeight: CGFloat = 0
     private var cancellables = Set<AnyCancellable>()
@@ -76,7 +75,6 @@ class WindowManager: ObservableObject {
             permissionStatus = .granted
         } else {
             startMonitoring()
-            startSpaceScreenshotTimer()
         }
         
         $selectedApp
@@ -92,7 +90,6 @@ class WindowManager: ObservableObject {
     deinit {
         timer?.invalidate()
         hidePopupTimer?.invalidate()
-        spaceScreenshotTimer?.invalidate()
         axCleanupTimer?.invalidate()
         for (_, obs) in axObservers {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .defaultMode)
@@ -193,16 +190,6 @@ class WindowManager: ObservableObject {
                 }
         } catch {
             // silently ignore repeated screenshot errors to avoid log spam
-        }
-    }
-    
-    private func startSpaceScreenshotTimer() {
-        spaceScreenshotTimer?.invalidate()
-        spaceScreenshotTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self = self, let spaceID = self.currentSpaceID else { return }
-                await self.captureSpaceScreenshotAsync(for: spaceID, displayID: self.lastDisplayIDForScreenshot)
-            }
         }
     }
     
