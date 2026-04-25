@@ -12,7 +12,7 @@ class Ginbar < Formula
   #
   # Until then, install from the latest source with:
   #   brew install --HEAD ginbar
-  head "https://github.com/richmidwinter/GinBar.git", branch: "main"
+  head "https://github.com/richmidwinter/GinBar.git", branch: "master"
 
   depends_on macos: :ventura
   depends_on xcode: [":build"]
